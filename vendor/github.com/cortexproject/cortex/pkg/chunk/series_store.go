@@ -112,7 +112,7 @@ func (c *seriesStore) Get(ctx context.Context, userID string, from, through mode
 	chunks := chks[0]
 	fetcher := fetchers[0]
 	// Protect ourselves against OOMing.
-	maxChunksPerQuery := c.limits.MaxChunksPerQuery(userID)
+	maxChunksPerQuery := c.limits.MaxChunksPerQueryFromStore(userID)
 	if maxChunksPerQuery > 0 && len(chunks) > maxChunksPerQuery {
 		err := QueryError(fmt.Sprintf("Query %v fetched too many chunks (%d > %d)", allMatchers, len(chunks), maxChunksPerQuery))
 		level.Error(log).Log("err", err)
@@ -408,7 +408,7 @@ func (c *seriesStore) lookupLabelNamesBySeries(ctx context.Context, from, throug
 	return result.Strings(), nil
 }
 
-// Put implements ChunkStore
+// Put implements Store
 func (c *seriesStore) Put(ctx context.Context, chunks []Chunk) error {
 	for _, chunk := range chunks {
 		if err := c.PutOne(ctx, chunk.From, chunk.Through, chunk); err != nil {
@@ -418,7 +418,7 @@ func (c *seriesStore) Put(ctx context.Context, chunks []Chunk) error {
 	return nil
 }
 
-// PutOne implements ChunkStore
+// PutOne implements Store
 func (c *seriesStore) PutOne(ctx context.Context, from, through model.Time, chunk Chunk) error {
 	log, ctx := spanlogger.New(ctx, "SeriesStore.PutOne")
 	defer log.Finish()

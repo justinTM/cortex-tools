@@ -14,11 +14,12 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/version"
 	"github.com/weaveworks/common/instrument"
 
 	"github.com/cortexproject/cortex/pkg/configs/userconfig"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	tls_cfg "github.com/cortexproject/cortex/pkg/util/tls"
 )
 
@@ -140,6 +141,8 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 		client.Transport = &http.Transport{TLSClientConfig: tlsConfig}
 	}
 
+	req.Header.Set("User-Agent", fmt.Sprintf("Cortex/%s", version.Version))
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -152,7 +155,7 @@ func doRequest(endpoint string, timeout time.Duration, tlsConfig *tls.Config, si
 
 	var config ConfigsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		level.Error(util.Logger).Log("msg", "configs: couldn't decode JSON body", "err", err)
+		level.Error(util_log.Logger).Log("msg", "configs: couldn't decode JSON body", "err", err)
 		return nil, err
 	}
 

@@ -23,6 +23,7 @@ import (
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -150,6 +151,9 @@ type KVConfig struct {
 	// Timeout used when leaving the memberlist cluster.
 	LeaveTimeout time.Duration `yaml:"leave_timeout"`
 
+	// How much space to use to keep received and sent messages in memory (for troubleshooting).
+	MessageHistoryBufferBytes int `yaml:"message_history_buffer_bytes"`
+
 	TCPTransport TCPTransportConfig `yaml:",inline"`
 
 	// Where to put custom metrics. Metrics are not registered, if this is nil.
@@ -180,6 +184,7 @@ func (cfg *KVConfig) RegisterFlags(f *flag.FlagSet, prefix string) {
 	f.DurationVar(&cfg.PushPullInterval, prefix+"memberlist.pullpush-interval", 0, "How often to use pull/push sync. Uses memberlist LAN defaults if 0.")
 	f.DurationVar(&cfg.GossipToTheDeadTime, prefix+"memberlist.gossip-to-dead-nodes-time", 0, "How long to keep gossiping to dead nodes, to give them chance to refute their death. Uses memberlist LAN defaults if 0.")
 	f.DurationVar(&cfg.DeadNodeReclaimTime, prefix+"memberlist.dead-node-reclaim-time", 0, "How soon can dead node's name be reclaimed with new address. Defaults to 0, which is disabled.")
+	f.IntVar(&cfg.MessageHistoryBufferBytes, prefix+"memberlist.message-history-buffer-bytes", 0, "How much space to use for keeping received and sent messages in memory for troubleshooting (two buffers). 0 to disable.")
 
 	cfg.TCPTransport.RegisterFlags(f, prefix)
 }
@@ -188,7 +193,7 @@ func generateRandomSuffix() string {
 	suffix := make([]byte, 4)
 	_, err := rand.Read(suffix)
 	if err != nil {
-		level.Error(util.Logger).Log("msg", "failed to generate random suffix", "err", err)
+		level.Error(util_log.Logger).Log("msg", "failed to generate random suffix", "err", err)
 		return "error"
 	}
 	return fmt.Sprintf("%2x", suffix)
@@ -225,6 +230,15 @@ type KV struct {
 	watchers       map[string][]chan string
 	prefixWatchers map[string][]chan string
 
+	// Buffers with sent and received messages. Used for troubleshooting only.
+	// New messages are appended, old messages (based on configured size limit) removed from the front.
+	messagesMu           sync.Mutex
+	sentMessages         []message
+	sentMessagesSize     int
+	receivedMessages     []message
+	receivedMessagesSize int
+	messageCounter       int // Used to give each message in the sentMessages and receivedMessages a unique ID, for UI.
+
 	// closed on shutdown
 	shutdown chan struct{}
 
@@ -238,13 +252,16 @@ type KV struct {
 	totalSizeOfPushes                   prometheus.Counter
 	numberOfBroadcastMessagesInQueue    prometheus.GaugeFunc
 	totalSizeOfBroadcastMessagesInQueue prometheus.Gauge
+	numberOfBroadcastMessagesDropped    prometheus.Counter
 	casAttempts                         prometheus.Counter
 	casFailures                         prometheus.Counter
 	casSuccesses                        prometheus.Counter
 	watchPrefixDroppedNotifications     *prometheus.CounterVec
 
-	storeValuesDesc *prometheus.Desc
-	storeSizesDesc  *prometheus.Desc
+	storeValuesDesc        *prometheus.Desc
+	storeSizesDesc         *prometheus.Desc
+	storeTombstones        *prometheus.GaugeVec
+	storeRemovedTombstones *prometheus.CounterVec
 
 	memberlistMembersCount prometheus.GaugeFunc
 	memberlistHealthScore  prometheus.GaugeFunc
@@ -253,6 +270,19 @@ type KV struct {
 	// where updates are coming from network, but when running tests with many
 	// goroutines using same KV, default can be too low.
 	maxCasRetries int
+}
+
+// Message describes incoming or outgoing message, and local state after applying incoming message, or state when sending message.
+// Fields are exported for templating to work.
+type message struct {
+	ID   int       // Unique local ID of the message.
+	Time time.Time // Time when message was sent or received.
+	Size int       // Message size
+	Pair KeyValuePair
+
+	// Following values are computed on the receiving node, based on local state.
+	Version uint     // For sent message, which version the message reflects. For received message, version after applying the message.
+	Changes []string // List of changes in this message (as computed by *this* node).
 }
 
 type valueDesc struct {
@@ -265,6 +295,10 @@ type valueDesc struct {
 
 	// ID of codec used to write this value. Only used when sending full state.
 	codecID string
+}
+
+func (v valueDesc) String() string {
+	return fmt.Sprintf("size: %d, version: %d, codec: %s", len(v.value), v.version, v.codecID)
 }
 
 var (
@@ -456,7 +490,7 @@ func (m *KV) JoinMembers(members []string) (int, error) {
 }
 
 func (m *KV) joinMembersOnStartup(ctx context.Context, members []string) error {
-	reached, err := m.memberlist.Join(m.cfg.JoinMembers)
+	reached, err := m.memberlist.Join(members)
 	if err == nil {
 		level.Info(m.logger).Log("msg", "joined memberlist cluster", "reached_nodes", reached)
 		return nil
@@ -594,7 +628,7 @@ func (m *KV) get(key string, codec codec.Codec) (out interface{}, version uint, 
 		if mr, ok := out.(Mergeable); ok {
 			// remove ALL tombstones before returning to client.
 			// No need for clients to see them.
-			mr.RemoveTombstones(time.Time{})
+			_, _ = mr.RemoveTombstones(time.Time{})
 		}
 	}
 
@@ -852,14 +886,17 @@ func (m *KV) trySingleCas(key string, codec codec.Codec, f func(in interface{}) 
 func (m *KV) broadcastNewValue(key string, change Mergeable, version uint, codec codec.Codec) {
 	data, err := codec.Encode(change)
 	if err != nil {
-		level.Error(m.logger).Log("msg", "failed to encode change", "err", err)
+		level.Error(m.logger).Log("msg", "failed to encode change", "key", key, "version", version, "err", err)
+		m.numberOfBroadcastMessagesDropped.Inc()
 		return
 	}
 
 	kvPair := KeyValuePair{Key: key, Value: data, Codec: codec.CodecID()}
 	pairData, err := kvPair.Marshal()
 	if err != nil {
-		level.Error(m.logger).Log("msg", "failed to serialize KV pair", "err", err)
+		level.Error(m.logger).Log("msg", "failed to serialize KV pair", "key", key, "version", version, "err", err)
+		m.numberOfBroadcastMessagesDropped.Inc()
+		return
 	}
 
 	if len(pairData) > 65535 {
@@ -869,9 +906,18 @@ func (m *KV) broadcastNewValue(key string, change Mergeable, version uint, codec
 		//
 		// Typically messages are smaller (when dealing with couple of updates only), but can get bigger
 		// when broadcasting result of push/pull update.
-		level.Debug(m.logger).Log("msg", "broadcast message too big, not broadcasting", "len", len(pairData))
+		level.Debug(m.logger).Log("msg", "broadcast message too big, not broadcasting", "key", key, "version", version, "len", len(pairData))
+		m.numberOfBroadcastMessagesDropped.Inc()
 		return
 	}
+
+	m.addSentMessage(message{
+		Time:    time.Now(),
+		Size:    len(pairData),
+		Pair:    kvPair,
+		Version: version,
+		Changes: change.MergeContent(),
+	})
 
 	m.queueBroadcast(key, change.MergeContent(), version, pairData)
 }
@@ -914,10 +960,32 @@ func (m *KV) NotifyMsg(msg []byte) {
 
 	// we have a ring update! Let's merge it with our version of the ring for given key
 	mod, version, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
+
+	changes := []string(nil)
+	if mod != nil {
+		changes = mod.MergeContent()
+	}
+
+	m.addReceivedMessage(message{
+		Time:    time.Now(),
+		Size:    len(msg),
+		Pair:    kvPair,
+		Version: version,
+		Changes: changes,
+	})
+
 	if err != nil {
 		level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
 	} else if version > 0 {
 		m.notifyWatchers(kvPair.Key)
+
+		m.addSentMessage(message{
+			Time:    time.Now(),
+			Size:    len(msg),
+			Pair:    kvPair,
+			Version: version,
+			Changes: changes,
+		})
 
 		// Forward this message
 		// Memberlist will modify message once this function returns, so we need to make a copy
@@ -970,6 +1038,7 @@ func (m *KV) LocalState(join bool) []byte {
 	// [4-bytes length of marshalled KV pair] [marshalled KV pair]
 
 	buf := bytes.Buffer{}
+	sent := time.Now()
 
 	kvPair := KeyValuePair{}
 	for key, val := range m.store {
@@ -999,6 +1068,13 @@ func (m *KV) LocalState(join bool) []byte {
 			continue
 		}
 		buf.Write(ser)
+
+		m.addSentMessage(message{
+			Time:    sent,
+			Size:    len(ser),
+			Pair:    kvPair, // Makes a copy of kvPair.
+			Version: val.version,
+		})
 	}
 
 	m.totalSizeOfPulls.Add(float64(buf.Len()))
@@ -1009,8 +1085,10 @@ func (m *KV) LocalState(join bool) []byte {
 //
 // This is 'push' part of push/pull sync. We merge incoming KV store (all keys and values) with ours.
 //
-// Data is full state of remote KV store, as generated by `LocalState` method (run on another node).
+// Data is full state of remote KV store, as generated by LocalState method (run on another node).
 func (m *KV) MergeRemoteState(data []byte, join bool) {
+	received := time.Now()
+
 	m.initWG.Wait()
 
 	m.numberOfPushes.Inc()
@@ -1053,6 +1131,20 @@ func (m *KV) MergeRemoteState(data []byte, join bool) {
 
 		// we have both key and value, try to merge it with our state
 		change, newver, err := m.mergeBytesValueForKey(kvPair.Key, kvPair.Value, codec)
+
+		changes := []string(nil)
+		if change != nil {
+			changes = change.MergeContent()
+		}
+
+		m.addReceivedMessage(message{
+			Time:    received,
+			Size:    int(kvPairLength),
+			Pair:    kvPair, // Makes a copy of kvPair.
+			Version: newver,
+			Changes: changes,
+		})
+
 		if err != nil {
 			level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
 		} else if newver > 0 {
@@ -1105,7 +1197,9 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 
 	if m.cfg.LeftIngestersTimeout > 0 {
 		limit := time.Now().Add(-m.cfg.LeftIngestersTimeout)
-		result.RemoveTombstones(limit)
+		total, removed := result.RemoveTombstones(limit)
+		m.storeTombstones.WithLabelValues(key).Set(float64(total))
+		m.storeRemovedTombstones.WithLabelValues(key).Add(float64(removed))
 	}
 
 	encoded, err := codec.Encode(result)
@@ -1150,4 +1244,72 @@ func computeNewValue(incoming Mergeable, stored []byte, c codec.Codec, cas bool)
 	// otherwise we have two mergeables, so merge them
 	change, err := oldVal.Merge(incoming, cas)
 	return oldVal, change, err
+}
+
+func (m *KV) storeCopy() map[string]valueDesc {
+	m.storeMu.Lock()
+	defer m.storeMu.Unlock()
+
+	result := make(map[string]valueDesc, len(m.store))
+	for k, v := range m.store {
+		result[k] = v
+	}
+	return result
+}
+func (m *KV) addReceivedMessage(msg message) {
+	if m.cfg.MessageHistoryBufferBytes == 0 {
+		return
+	}
+
+	m.messagesMu.Lock()
+	defer m.messagesMu.Unlock()
+
+	m.messageCounter++
+	msg.ID = m.messageCounter
+
+	m.receivedMessages, m.receivedMessagesSize = addMessageToBuffer(m.receivedMessages, m.receivedMessagesSize, m.cfg.MessageHistoryBufferBytes, msg)
+}
+
+func (m *KV) addSentMessage(msg message) {
+	if m.cfg.MessageHistoryBufferBytes == 0 {
+		return
+	}
+
+	m.messagesMu.Lock()
+	defer m.messagesMu.Unlock()
+
+	m.messageCounter++
+	msg.ID = m.messageCounter
+
+	m.sentMessages, m.sentMessagesSize = addMessageToBuffer(m.sentMessages, m.sentMessagesSize, m.cfg.MessageHistoryBufferBytes, msg)
+}
+
+func (m *KV) getSentAndReceivedMessages() (sent, received []message) {
+	m.messagesMu.Lock()
+	defer m.messagesMu.Unlock()
+
+	// Make copy of both slices.
+	return append([]message(nil), m.sentMessages...), append([]message(nil), m.receivedMessages...)
+}
+
+func (m *KV) deleteSentReceivedMessages() {
+	m.messagesMu.Lock()
+	defer m.messagesMu.Unlock()
+
+	m.sentMessages = nil
+	m.sentMessagesSize = 0
+	m.receivedMessages = nil
+	m.receivedMessagesSize = 0
+}
+
+func addMessageToBuffer(msgs []message, size int, limit int, msg message) ([]message, int) {
+	msgs = append(msgs, msg)
+	size += msg.Size
+
+	for len(msgs) > 0 && size > limit {
+		size -= msgs[0].Size
+		msgs = msgs[1:]
+	}
+
+	return msgs, size
 }

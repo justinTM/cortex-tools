@@ -74,7 +74,7 @@ func (r RuleNamespace) LintExpressions(backend string) (int, int, error) {
 
 // CheckRecordingRules checks that recording rules have at least one colon in their name, this is based
 // on the recording rules best practices here: https://prometheus.io/docs/practices/rules/
-// Returns the number of rules that don't match the requirements, and error if that number is not 0.
+// Returns the number of rules that don't match the requirements.
 func (r RuleNamespace) CheckRecordingRules(strict bool) int {
 	var name string
 	var count int
@@ -106,14 +106,27 @@ func (r RuleNamespace) CheckRecordingRules(strict bool) int {
 }
 
 // AggregateBy modifies the aggregation rules in groups to include a given Label.
-func (r RuleNamespace) AggregateBy(label string) (int, int, error) {
-	// `count` represents the number of rules we evalated.
+// If the applyTo function is provided, the aggregation is applied only to rules
+// for which the applyTo function returns true.
+func (r RuleNamespace) AggregateBy(label string, applyTo func(group rwrulefmt.RuleGroup, rule rulefmt.RuleNode) bool) (int, int, error) {
+	// `count` represents the number of rules we evaluated.
 	// `mod` represents the number of rules we modified - a modification can either be a lint or adding the
 	// label in the aggregation.
 	var count, mod int
 
 	for i, group := range r.Groups {
 		for j, rule := range group.Rules {
+			// Skip it if the applyTo function returns false.
+			if applyTo != nil && !applyTo(group, rule) {
+				log.WithFields(log.Fields{
+					"group": group.Name,
+					"rule":  getRuleName(rule),
+				}).Debugf("skipped")
+
+				count++
+				continue
+			}
+
 			log.WithFields(log.Fields{"rule": getRuleName(rule)}).Debugf("evaluating...")
 			exp, err := parser.ParseExpr(rule.Expr.Value)
 			if err != nil {

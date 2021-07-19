@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 
+	"io"
+
 	ot "github.com/opentracing/opentracing-go"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/math"
 )
 
 // Callback from an IndexQuery.
@@ -34,7 +36,7 @@ func DoParallelQueries(
 
 	queue := make(chan chunk.IndexQuery)
 	incomingErrors := make(chan error)
-	n := util.Min(len(queries), QueryParallelism)
+	n := math.Min(len(queries), QueryParallelism)
 	// Run n parallel goroutines fetching queries from the queue
 	for i := 0; i < n; i++ {
 		go func() {
@@ -124,4 +126,23 @@ func EnsureDirectory(dir string) error {
 		return fmt.Errorf("not a directory: %s", dir)
 	}
 	return err
+}
+
+// ReadCloserWithContextCancelFunc helps with cancelling the context when closing a ReadCloser.
+// NOTE: The consumer of ReadCloserWithContextCancelFunc should always call the Close method when it is done reading which otherwise could cause a resource leak.
+type ReadCloserWithContextCancelFunc struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func NewReadCloserWithContextCancelFunc(readCloser io.ReadCloser, cancel context.CancelFunc) io.ReadCloser {
+	return ReadCloserWithContextCancelFunc{
+		ReadCloser: readCloser,
+		cancel:     cancel,
+	}
+}
+
+func (r ReadCloserWithContextCancelFunc) Close() error {
+	defer r.cancel()
+	return r.ReadCloser.Close()
 }

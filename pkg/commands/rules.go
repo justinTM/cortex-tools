@@ -6,11 +6,12 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
-	"text/tabwriter"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/pkg/rulefmt"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/alecthomas/kingpin.v2"
 	yamlv3 "gopkg.in/yaml.v3"
@@ -18,6 +19,7 @@ import (
 	"github.com/grafana/cortex-tools/pkg/client"
 	"github.com/grafana/cortex-tools/pkg/printer"
 	"github.com/grafana/cortex-tools/pkg/rules"
+	"github.com/grafana/cortex-tools/pkg/rules/rwrulefmt"
 )
 
 const (
@@ -37,6 +39,7 @@ var (
 	})
 
 	backends = []string{rules.CortexBackend, rules.LokiBackend} // list of supported backend types
+	formats  = []string{"json", "yaml", "table"}                // list of supported formats for the list command
 )
 
 // RuleCommand configures and executes rule related cortex operations
@@ -58,12 +61,16 @@ type RuleCommand struct {
 	RuleFilesPath string
 
 	// Sync/Diff Rules Config
+	Namespaces           string
+	namespacesMap        map[string]struct{}
 	IgnoredNamespaces    string
 	ignoredNamespacesMap map[string]struct{}
 
 	// Prepare Rules Config
-	InPlaceEdit      bool
-	AggregationLabel string
+	InPlaceEdit                            bool
+	AggregationLabel                       string
+	AggregationLabelExcludedRuleGroups     string
+	aggregationLabelExcludedRuleGroupsList map[string]struct{}
 
 	// Lint Rules Config
 	LintDryRun bool
@@ -71,13 +78,20 @@ type RuleCommand struct {
 	// Rules check flags
 	Strict bool
 
+	// List Rules Config
+	Format string
+
 	DisableColor bool
+
+	// Diff Rules Config
+	Verbose bool
 }
 
 // Register rule related commands and flags with the kingpin application
 func (r *RuleCommand) Register(app *kingpin.Application) {
 	rulesCmd := app.Command("rules", "View & edit rules stored in cortex.").PreAction(r.setup)
-	rulesCmd.Flag("key", "Api key to use when contacting cortex, alternatively set $CORTEX_API_KEY.").Default("").Envar("CORTEX_API_KEY").StringVar(&r.ClientConfig.Key)
+	rulesCmd.Flag("user", "API user to use when contacting cortex, alternatively set CORTEX_API_USER. If empty, CORTEX_TENANT_ID will be used instead.").Default("").Envar("CORTEX_API_USER").StringVar(&r.ClientConfig.User)
+	rulesCmd.Flag("key", "API key to use when contacting cortex, alternatively set CORTEX_API_KEY.").Default("").Envar("CORTEX_API_KEY").StringVar(&r.ClientConfig.Key)
 	rulesCmd.Flag("backend", "Backend type to interact with: <cortex|loki>").Default("cortex").EnumVar(&r.Backend, backends...)
 
 	// Register rule commands
@@ -124,6 +138,11 @@ func (r *RuleCommand) Register(app *kingpin.Application) {
 			Required().
 			StringVar(&r.ClientConfig.ID)
 
+		c.Flag("use-legacy-routes", "If set, API requests to cortex will use the legacy /api/prom/ routes, alternatively set CORTEX_USE_LEGACY_ROUTES.").
+			Default("false").
+			Envar("CORTEX_USE_LEGACY_ROUTES").
+			BoolVar(&r.ClientConfig.UseLegacyRoutes)
+
 		c.Flag("tls-ca-path", "TLS CA certificate to verify cortex API as part of mTLS, alternatively set CORTEX_TLS_CA_PATH.").
 			Default("").
 			Envar("CORTEX_TLS_CA_CERT").
@@ -157,16 +176,21 @@ func (r *RuleCommand) Register(app *kingpin.Application) {
 	loadRulesCmd.Arg("rule-files", "The rule files to check.").Required().ExistingFilesVar(&r.RuleFilesList)
 
 	// Diff Command
-	diffRulesCmd.Flag("ignored-namespaces", "comma-separated list of namespaces to ignore during a diff.").StringVar(&r.IgnoredNamespaces)
+	diffRulesCmd.Arg("rule-files", "The rule files to check.").ExistingFilesVar(&r.RuleFilesList)
+	diffRulesCmd.Flag("namespaces", "comma-separated list of namespaces to check during a diff. Cannot be used together with --ignored-namespaces.").StringVar(&r.Namespaces)
+	diffRulesCmd.Flag("ignored-namespaces", "comma-separated list of namespaces to ignore during a diff. Cannot be used together with --namespaces.").StringVar(&r.IgnoredNamespaces)
 	diffRulesCmd.Flag("rule-files", "The rule files to check. Flag can be reused to load multiple files.").StringVar(&r.RuleFiles)
 	diffRulesCmd.Flag(
 		"rule-dirs",
 		"Comma separated list of paths to directories containing rules yaml files. Each file in a directory with a .yml or .yaml suffix will be parsed.",
 	).StringVar(&r.RuleFilesPath)
 	diffRulesCmd.Flag("disable-color", "disable colored output").BoolVar(&r.DisableColor)
+	diffRulesCmd.Flag("verbose", "show diff output with rules changes").BoolVar(&r.Verbose)
 
 	// Sync Command
-	syncRulesCmd.Flag("ignored-namespaces", "comma-separated list of namespaces to ignore during a sync.").StringVar(&r.IgnoredNamespaces)
+	syncRulesCmd.Arg("rule-files", "The rule files to check.").ExistingFilesVar(&r.RuleFilesList)
+	syncRulesCmd.Flag("namespaces", "comma-separated list of namespaces to check during a diff. Cannot be used together with --ignored-namespaces.").StringVar(&r.Namespaces)
+	syncRulesCmd.Flag("ignored-namespaces", "comma-separated list of namespaces to ignore during a sync. Cannot be used together with --namespaces.").StringVar(&r.IgnoredNamespaces)
 	syncRulesCmd.Flag("rule-files", "The rule files to check. Flag can be reused to load multiple files.").StringVar(&r.RuleFiles)
 	syncRulesCmd.Flag(
 		"rule-dirs",
@@ -185,6 +209,7 @@ func (r *RuleCommand) Register(app *kingpin.Application) {
 		"edits the rule file in place",
 	).Short('i').BoolVar(&r.InPlaceEdit)
 	prepareCmd.Flag("label", "label to include as part of the aggregations.").Default(defaultPrepareAggregationLabel).Short('l').StringVar(&r.AggregationLabel)
+	prepareCmd.Flag("label-excluded-rule-groups", "Comma separated list of rule group names to exclude when including the configured label to aggregations.").StringVar(&r.AggregationLabelExcludedRuleGroups)
 
 	// Lint Command
 	lintCmd.Arg("rule-files", "The rule files to check.").ExistingFilesVar(&r.RuleFilesList)
@@ -203,6 +228,10 @@ func (r *RuleCommand) Register(app *kingpin.Application) {
 		"Comma separated list of paths to directories containing rules yaml files. Each file in a directory with a .yml or .yaml suffix will be parsed.",
 	).StringVar(&r.RuleFilesPath)
 	checkCmd.Flag("strict", "fails rules checks that do not match best practices exactly").BoolVar(&r.Strict)
+
+	// List Command
+	listCmd.Flag("format", "Backend type to interact with: <json|yaml|table>").Default("table").EnumVar(&r.Format, formats...)
+	listCmd.Flag("disable-color", "disable colored output").BoolVar(&r.DisableColor)
 }
 
 func (r *RuleCommand) setup(k *kingpin.ParseContext) error {
@@ -210,6 +239,11 @@ func (r *RuleCommand) setup(k *kingpin.ParseContext) error {
 		ruleLoadTimestamp,
 		ruleLoadSuccessTimestamp,
 	)
+
+	// Loki's non-legacy route does not match Cortex, but the legacy one does.
+	if r.Backend == rules.LokiBackend {
+		r.ClientConfig.UseLegacyRoutes = true
+	}
 
 	cli, err := client.New(r.ClientConfig)
 	if err != nil {
@@ -221,11 +255,35 @@ func (r *RuleCommand) setup(k *kingpin.ParseContext) error {
 }
 
 func (r *RuleCommand) setupFiles() error {
+	if r.Namespaces != "" && r.IgnoredNamespaces != "" {
+		return errors.New("--namespaces and --ignored-namespaces cannot be set at the same time")
+	}
+
 	// Set up ignored namespaces map for sync/diff command
-	r.ignoredNamespacesMap = map[string]struct{}{}
-	for _, ns := range strings.Split(r.IgnoredNamespaces, ",") {
-		if ns != "" {
-			r.ignoredNamespacesMap[ns] = struct{}{}
+	if r.IgnoredNamespaces != "" {
+		r.ignoredNamespacesMap = map[string]struct{}{}
+		for _, ns := range strings.Split(r.IgnoredNamespaces, ",") {
+			if ns != "" {
+				r.ignoredNamespacesMap[ns] = struct{}{}
+			}
+		}
+	}
+
+	// Set up allowed namespaces map for sync/diff command
+	if r.Namespaces != "" {
+		r.namespacesMap = map[string]struct{}{}
+		for _, ns := range strings.Split(r.Namespaces, ",") {
+			if ns != "" {
+				r.namespacesMap[ns] = struct{}{}
+			}
+		}
+	}
+
+	// Set up rule groups excluded from label aggregation.
+	r.aggregationLabelExcludedRuleGroupsList = map[string]struct{}{}
+	for _, name := range strings.Split(r.AggregationLabelExcludedRuleGroups, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			r.aggregationLabelExcludedRuleGroupsList[name] = struct{}{}
 		}
 	}
 
@@ -278,18 +336,8 @@ func (r *RuleCommand) listRules(k *kingpin.ParseContext) error {
 
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 1, ' ', tabwriter.Debug)
-
-	fmt.Fprintln(w, "Namespace\t Rule Group")
-	for ns, rulegroups := range rules {
-		for _, rg := range rulegroups {
-			fmt.Fprintf(w, "%s\t %s\n", ns, rg.Name)
-		}
-	}
-
-	w.Flush()
-
-	return nil
+	p := printer.New(r.DisableColor)
+	return p.PrintRuleSet(rules, r.Format, os.Stdout)
 }
 
 func (r *RuleCommand) printRules(k *kingpin.ParseContext) error {
@@ -337,6 +385,7 @@ func (r *RuleCommand) loadRules(k *kingpin.ParseContext) error {
 
 	for _, ns := range nss {
 		for _, group := range ns.Groups {
+			fmt.Printf("group: '%v', ns: '%v'\n", group.Name, ns.Namespace)
 			curGroup, err := r.cli.GetRuleGroup(context.Background(), ns.Namespace, group.Name)
 			if err != nil && err != client.ErrResourceNotFound {
 				return errors.Wrap(err, "load operation unsuccessful, unable to contact cortex api")
@@ -372,6 +421,18 @@ func (r *RuleCommand) loadRules(k *kingpin.ParseContext) error {
 	return nil
 }
 
+// shouldCheckNamespace returns whether the namespace should be checked according to the allowed and ignored namespaces
+func (r *RuleCommand) shouldCheckNamespace(namespace string) bool {
+	// when we have an allow list, only check those that we have explicitly defined.
+	if r.namespacesMap != nil {
+		_, allowed := r.namespacesMap[namespace]
+		return allowed
+	}
+
+	_, ignored := r.ignoredNamespacesMap[namespace]
+	return !ignored
+}
+
 func (r *RuleCommand) diffRules(k *kingpin.ParseContext) error {
 	err := r.setupFiles()
 	if err != nil {
@@ -384,6 +445,9 @@ func (r *RuleCommand) diffRules(k *kingpin.ParseContext) error {
 	}
 
 	currentNamespaceMap, err := r.cli.ListRules(context.Background(), "")
+	//TODO: Skipping the 404s here might end up in an unsual scenario.
+	// If we're unable to reach the Cortex API due to a bad URL, we'll assume no rules are
+	// part of the namespace and provide a diff of the whole ruleset.
 	if err != nil && err != client.ErrResourceNotFound {
 		return errors.Wrap(err, "diff operation unsuccessful, unable to contact cortex api")
 	}
@@ -391,6 +455,10 @@ func (r *RuleCommand) diffRules(k *kingpin.ParseContext) error {
 	changes := []rules.NamespaceChange{}
 
 	for _, ns := range nss {
+		if !r.shouldCheckNamespace(ns.Namespace) {
+			continue
+		}
+
 		currentNamespace, exists := currentNamespaceMap[ns.Namespace]
 		if !exists {
 			changes = append(changes, rules.NamespaceChange{
@@ -413,17 +481,19 @@ func (r *RuleCommand) diffRules(k *kingpin.ParseContext) error {
 	}
 
 	for ns, deletedGroups := range currentNamespaceMap {
-		if _, ignored := r.ignoredNamespacesMap[ns]; !ignored {
-			changes = append(changes, rules.NamespaceChange{
-				State:         rules.Deleted,
-				Namespace:     ns,
-				GroupsDeleted: deletedGroups,
-			})
+		if !r.shouldCheckNamespace(ns) {
+			continue
 		}
+
+		changes = append(changes, rules.NamespaceChange{
+			State:         rules.Deleted,
+			Namespace:     ns,
+			GroupsDeleted: deletedGroups,
+		})
 	}
 
 	p := printer.New(r.DisableColor)
-	return p.PrintComparisonResult(changes, false)
+	return p.PrintComparisonResult(changes, r.Verbose)
 }
 
 func (r *RuleCommand) syncRules(k *kingpin.ParseContext) error {
@@ -438,6 +508,9 @@ func (r *RuleCommand) syncRules(k *kingpin.ParseContext) error {
 	}
 
 	currentNamespaceMap, err := r.cli.ListRules(context.Background(), "")
+	//TODO: Skipping the 404s here might end up in an unsual scenario.
+	// If we're unable to reach the Cortex API due to a bad URL, we'll assume no rules are
+	// part of the namespace and provide a diff of the whole ruleset.
 	if err != nil && err != client.ErrResourceNotFound {
 		return errors.Wrap(err, "sync operation unsuccessful, unable to contact cortex api")
 	}
@@ -445,6 +518,10 @@ func (r *RuleCommand) syncRules(k *kingpin.ParseContext) error {
 	changes := []rules.NamespaceChange{}
 
 	for _, ns := range nss {
+		if !r.shouldCheckNamespace(ns.Namespace) {
+			continue
+		}
+
 		currentNamespace, exists := currentNamespaceMap[ns.Namespace]
 		if !exists {
 			changes = append(changes, rules.NamespaceChange{
@@ -467,13 +544,15 @@ func (r *RuleCommand) syncRules(k *kingpin.ParseContext) error {
 	}
 
 	for ns, deletedGroups := range currentNamespaceMap {
-		if _, ignored := r.ignoredNamespacesMap[ns]; !ignored {
-			changes = append(changes, rules.NamespaceChange{
-				State:         rules.Deleted,
-				Namespace:     ns,
-				GroupsDeleted: deletedGroups,
-			})
+		if !r.shouldCheckNamespace(ns) {
+			continue
 		}
+
+		changes = append(changes, rules.NamespaceChange{
+			State:         rules.Deleted,
+			Namespace:     ns,
+			GroupsDeleted: deletedGroups,
+		})
 	}
 
 	err = r.executeChanges(context.Background(), changes)
@@ -488,6 +567,10 @@ func (r *RuleCommand) executeChanges(ctx context.Context, changes []rules.Namesp
 	var err error
 	for _, ch := range changes {
 		for _, g := range ch.GroupsCreated {
+			if !r.shouldCheckNamespace(ch.Namespace) {
+				continue
+			}
+
 			log.WithFields(log.Fields{
 				"group":     g.Name,
 				"namespace": ch.Namespace,
@@ -499,6 +582,10 @@ func (r *RuleCommand) executeChanges(ctx context.Context, changes []rules.Namesp
 		}
 
 		for _, g := range ch.GroupsUpdated {
+			if !r.shouldCheckNamespace(ch.Namespace) {
+				continue
+			}
+
 			log.WithFields(log.Fields{
 				"group":     g.New.Name,
 				"namespace": ch.Namespace,
@@ -510,6 +597,10 @@ func (r *RuleCommand) executeChanges(ctx context.Context, changes []rules.Namesp
 		}
 
 		for _, g := range ch.GroupsDeleted {
+			if !r.shouldCheckNamespace(ch.Namespace) {
+				continue
+			}
+
 			log.WithFields(log.Fields{
 				"group":     g.Name,
 				"namespace": ch.Namespace,
@@ -538,9 +629,15 @@ func (r *RuleCommand) prepare(k *kingpin.ParseContext) error {
 		return errors.Wrap(err, "prepare operation unsuccessful, unable to parse rules files")
 	}
 
+	// Do not apply the aggregation label to excluded rule groups.
+	applyTo := func(group rwrulefmt.RuleGroup, rule rulefmt.RuleNode) bool {
+		_, excluded := r.aggregationLabelExcludedRuleGroupsList[group.Name]
+		return !excluded
+	}
+
 	var count, mod int
 	for _, ruleNamespace := range namespaces {
-		c, m, err := ruleNamespace.AggregateBy(r.AggregationLabel)
+		c, m, err := ruleNamespace.AggregateBy(r.AggregationLabel, applyTo)
 		if err != nil {
 			return err
 		}
@@ -609,10 +706,59 @@ func (r *RuleCommand) checkRecordingRuleNames(k *kingpin.ParseContext) error {
 		if n != 0 {
 			return fmt.Errorf("%d erroneous recording rule names", n)
 		}
+		duplicateRules := checkDuplicates(ruleNamespace.Groups)
+		if len(duplicateRules) != 0 {
+			fmt.Printf("%d duplicate rule(s) found.\n", len(duplicateRules))
+			for _, n := range duplicateRules {
+				fmt.Printf("Metric: %s\nLabel(s):\n", n.metric)
+				for i, l := range n.label {
+					fmt.Printf("\t%s: %s\n", i, l)
+				}
+			}
+			fmt.Println("Might cause inconsistency while recording expressions.")
+		}
 	}
 
 	return nil
 }
+
+// Taken from https://github.com/prometheus/prometheus/blob/8c8de46003d1800c9d40121b4a5e5de8582ef6e1/cmd/promtool/main.go#L403
+type compareRuleType struct {
+	metric string
+	label  map[string]string
+}
+
+func checkDuplicates(groups []rwrulefmt.RuleGroup) []compareRuleType {
+	var duplicates []compareRuleType
+
+	for _, group := range groups {
+		for index, rule := range group.Rules {
+			inst := compareRuleType{
+				metric: ruleMetric(rule),
+				label:  rule.Labels,
+			}
+			for i := 0; i < index; i++ {
+				t := compareRuleType{
+					metric: ruleMetric(group.Rules[i]),
+					label:  group.Rules[i].Labels,
+				}
+				if reflect.DeepEqual(t, inst) {
+					duplicates = append(duplicates, t)
+				}
+			}
+		}
+	}
+	return duplicates
+}
+
+func ruleMetric(rule rulefmt.RuleNode) string {
+	if rule.Alert.Value != "" {
+		return rule.Alert.Value
+	}
+	return rule.Record.Value
+}
+
+// End taken from https://github.com/prometheus/prometheus/blob/8c8de46003d1800c9d40121b4a5e5de8582ef6e1/cmd/promtool/main.go#L403
 
 // save saves a set of rule files to to disk. You can specify whenever you want the
 // file(s) to be edited in-place.

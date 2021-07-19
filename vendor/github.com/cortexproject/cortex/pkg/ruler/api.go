@@ -20,17 +20,16 @@ import (
 	"github.com/weaveworks/common/user"
 	"gopkg.in/yaml.v3"
 
-	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/ruler/rules"
-	store "github.com/cortexproject/cortex/pkg/ruler/rules"
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/ruler/rulespb"
+	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
+	"github.com/cortexproject/cortex/pkg/tenant"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // In order to reimplement the prometheus rules API, a large amount of code was copied over
-// This is required because the prometheus api implementation does not pass a context to
-// the rule retrieval function.
-// https://github.com/prometheus/prometheus/blob/2aacd807b3ec6ddd90ae55f3a42f4cffed561ea9/web/api/v1/api.go#L108
-// https://github.com/prometheus/prometheus/pull/4999
+// This is required because the prometheus api implementation does not allow us to return errors
+// on rule lookups, which might fail in Cortex's case.
 
 type response struct {
 	Status    string       `json:"status"`
@@ -120,9 +119,26 @@ func respondError(logger log.Logger, w http.ResponseWriter, msg string) {
 	}
 }
 
-func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
-	userID, ctx, err := user.ExtractOrgIDFromHTTPRequest(req)
+// API is used to handle HTTP requests for the ruler service
+type API struct {
+	ruler *Ruler
+	store rulestore.RuleStore
+
+	logger log.Logger
+}
+
+// NewAPI returns a new API struct with the provided ruler and rule store
+func NewAPI(r *Ruler, s rulestore.RuleStore, logger log.Logger) *API {
+	return &API{
+		ruler:  r,
+		store:  s,
+		logger: logger,
+	}
+}
+
+func (a *API) PrometheusRules(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil || userID == "" {
 		level.Error(logger).Log("msg", "error extracting org id from context", "err", err)
 		respondError(logger, w, "no valid org id found")
@@ -130,7 +146,7 @@ func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	rgs, err := r.GetRules(ctx)
+	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
 		respondError(logger, w, err.Error())
@@ -154,8 +170,8 @@ func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 				alerts := make([]*Alert, 0, len(rl.Alerts))
 				for _, a := range rl.Alerts {
 					alerts = append(alerts, &Alert{
-						Labels:      client.FromLabelAdaptersToLabels(a.Labels),
-						Annotations: client.FromLabelAdaptersToLabels(a.Annotations),
+						Labels:      cortexpb.FromLabelAdaptersToLabels(a.Labels),
+						Annotations: cortexpb.FromLabelAdaptersToLabels(a.Annotations),
 						State:       a.GetState(),
 						ActiveAt:    &a.ActiveAt,
 						Value:       strconv.FormatFloat(a.Value, 'e', -1, 64),
@@ -166,8 +182,8 @@ func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 					Name:           rl.Rule.GetAlert(),
 					Query:          rl.Rule.GetExpr(),
 					Duration:       rl.Rule.For.Seconds(),
-					Labels:         client.FromLabelAdaptersToLabels(rl.Rule.Labels),
-					Annotations:    client.FromLabelAdaptersToLabels(rl.Rule.Annotations),
+					Labels:         cortexpb.FromLabelAdaptersToLabels(rl.Rule.Labels),
+					Annotations:    cortexpb.FromLabelAdaptersToLabels(rl.Rule.Annotations),
 					Alerts:         alerts,
 					Health:         rl.GetHealth(),
 					LastError:      rl.GetLastError(),
@@ -179,7 +195,7 @@ func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 				grp.Rules[i] = recordingRule{
 					Name:           rl.Rule.GetRecord(),
 					Query:          rl.Rule.GetExpr(),
-					Labels:         client.FromLabelAdaptersToLabels(rl.Rule.Labels),
+					Labels:         cortexpb.FromLabelAdaptersToLabels(rl.Rule.Labels),
 					Health:         rl.GetHealth(),
 					LastError:      rl.GetLastError(),
 					LastEvaluation: rl.GetEvaluationTimestamp(),
@@ -212,9 +228,9 @@ func (r *Ruler) PrometheusRules(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (r *Ruler) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
-	userID, ctx, err := user.ExtractOrgIDFromHTTPRequest(req)
+func (a *API) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil || userID == "" {
 		level.Error(logger).Log("msg", "error extracting org id from context", "err", err)
 		respondError(logger, w, "no valid org id found")
@@ -222,7 +238,7 @@ func (r *Ruler) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	rgs, err := r.GetRules(ctx)
+	rgs, err := a.ruler.GetRules(req.Context())
 
 	if err != nil {
 		respondError(logger, w, err.Error())
@@ -236,8 +252,8 @@ func (r *Ruler) PrometheusAlerts(w http.ResponseWriter, req *http.Request) {
 			if rl.Rule.Alert != "" {
 				for _, a := range rl.Alerts {
 					alerts = append(alerts, &Alert{
-						Labels:      client.FromLabelAdaptersToLabels(a.Labels),
-						Annotations: client.FromLabelAdaptersToLabels(a.Annotations),
+						Labels:      cortexpb.FromLabelAdaptersToLabels(a.Labels),
+						Annotations: cortexpb.FromLabelAdaptersToLabels(a.Annotations),
 						State:       a.GetState(),
 						ActiveAt:    &a.ActiveAt,
 						Value:       strconv.FormatFloat(a.Value, 'e', -1, 64),
@@ -343,7 +359,7 @@ func parseGroupName(params map[string]string) (string, error) {
 // and returns them in that order. It also allows users to require a namespace or group name and return
 // an error if it they can not be parsed.
 func parseRequest(req *http.Request, requireNamespace, requireGroup bool) (string, string, string, error) {
-	userID, err := user.ExtractOrgID(req.Context())
+	userID, err := tenant.TenantID(req.Context())
 	if err != nil {
 		return "", "", "", user.ErrNoOrgID
 	}
@@ -367,8 +383,8 @@ func parseRequest(req *http.Request, requireNamespace, requireGroup bool) (strin
 	return userID, namespace, group, nil
 }
 
-func (r *Ruler) ListRules(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
+func (a *API) ListRules(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
 
 	userID, namespace, _, err := parseRequest(req, false, false)
 	if err != nil {
@@ -377,13 +393,11 @@ func (r *Ruler) ListRules(w http.ResponseWriter, req *http.Request) {
 	}
 
 	level.Debug(logger).Log("msg", "retrieving rule groups with namespace", "userID", userID, "namespace", namespace)
-	rgs, err := r.store.ListRuleGroups(req.Context(), userID, namespace)
+	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, namespace)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	level.Debug(logger).Log("msg", "retrieved rule groups from rule store", "userID", userID, "num_namespaces", len(rgs))
 
 	if len(rgs) == 0 {
 		level.Info(logger).Log("msg", "no rule groups found", "userID", userID)
@@ -391,21 +405,29 @@ func (r *Ruler) ListRules(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	err = a.store.LoadRuleGroups(req.Context(), map[string]rulespb.RuleGroupList{userID: rgs})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	level.Debug(logger).Log("msg", "retrieved rule groups from rule store", "userID", userID, "num_namespaces", len(rgs))
+
 	formatted := rgs.Formatted()
 	marshalAndSend(formatted, w, logger)
 }
 
-func (r *Ruler) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
+func (a *API) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
 	userID, namespace, groupName, err := parseRequest(req, true, true)
 	if err != nil {
 		respondError(logger, w, err.Error())
 		return
 	}
 
-	rg, err := r.store.GetRuleGroup(req.Context(), userID, namespace, groupName)
+	rg, err := a.store.GetRuleGroup(req.Context(), userID, namespace, groupName)
 	if err != nil {
-		if err == store.ErrGroupNotFound {
+		if errors.Is(err, rulestore.ErrGroupNotFound) {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
@@ -413,12 +435,12 @@ func (r *Ruler) GetRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	formatted := store.FromProto(rg)
+	formatted := rulespb.FromProto(rg)
 	marshalAndSend(formatted, w, logger)
 }
 
-func (r *Ruler) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
+func (a *API) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
 	userID, namespace, _, err := parseRequest(req, true, false)
 	if err != nil {
 		respondError(logger, w, err.Error())
@@ -442,7 +464,7 @@ func (r *Ruler) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	errs := r.manager.ValidateRuleGroup(rg)
+	errs := a.ruler.manager.ValidateRuleGroup(rg)
 	if len(errs) > 0 {
 		e := []string{}
 		for _, err := range errs {
@@ -454,10 +476,29 @@ func (r *Ruler) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	rgProto := store.ToProto(userID, namespace, rg)
+	if err := a.ruler.AssertMaxRulesPerRuleGroup(userID, len(rg.Rules)); err != nil {
+		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rgs, err := a.store.ListRuleGroupsForUserAndNamespace(req.Context(), userID, "")
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to fetch current rule groups for validation", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := a.ruler.AssertMaxRuleGroups(userID, len(rgs)+1); err != nil {
+		level.Error(logger).Log("msg", "limit validation failure", "err", err.Error(), "user", userID)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	rgProto := rulespb.ToProto(userID, namespace, rg)
 
 	level.Debug(logger).Log("msg", "attempting to store rulegroup", "userID", userID, "group", rgProto.String())
-	err = r.store.SetRuleGroup(req.Context(), userID, namespace, rgProto)
+	err = a.store.SetRuleGroup(req.Context(), userID, namespace, rgProto)
 	if err != nil {
 		level.Error(logger).Log("msg", "unable to store rule group", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -467,8 +508,8 @@ func (r *Ruler) CreateRuleGroup(w http.ResponseWriter, req *http.Request) {
 	respondAccepted(w, logger)
 }
 
-func (r *Ruler) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
+func (a *API) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
 
 	userID, namespace, _, err := parseRequest(req, true, false)
 	if err != nil {
@@ -476,9 +517,9 @@ func (r *Ruler) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	err = r.store.DeleteNamespace(req.Context(), userID, namespace)
+	err = a.store.DeleteNamespace(req.Context(), userID, namespace)
 	if err != nil {
-		if err == rules.ErrGroupNamespaceNotFound {
+		if err == rulestore.ErrGroupNamespaceNotFound {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
@@ -489,8 +530,8 @@ func (r *Ruler) DeleteNamespace(w http.ResponseWriter, req *http.Request) {
 	respondAccepted(w, logger)
 }
 
-func (r *Ruler) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
-	logger := util.WithContext(req.Context(), util.Logger)
+func (a *API) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
+	logger := util_log.WithContext(req.Context(), a.logger)
 
 	userID, namespace, groupName, err := parseRequest(req, true, true)
 	if err != nil {
@@ -498,9 +539,9 @@ func (r *Ruler) DeleteRuleGroup(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	err = r.store.DeleteRuleGroup(req.Context(), userID, namespace, groupName)
+	err = a.store.DeleteRuleGroup(req.Context(), userID, namespace, groupName)
 	if err != nil {
-		if err == rules.ErrGroupNotFound {
+		if err == rulestore.ErrGroupNotFound {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}

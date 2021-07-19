@@ -16,6 +16,7 @@ builds:
       - darwin
     goarch:
       - amd64
+      - arm64
   - id: cortextool-linux
     ldflags:
       -s -w -X github.com/grafana/cortex-tools/pkg/version.Version={{.Version}}
@@ -52,6 +53,11 @@ archives:
     files:
       - none*
     format: binary
+  - id: needed-for-homebrew
+    builds:
+      - cortextool-linux
+      - cortextool-darwin
+    format: 'tar.gz'
 checksum:
   name_template: 'checksums.txt'
 snapshot:
@@ -65,9 +71,7 @@ changelog:
 dockers:
   - goos: linux
     goarch: amd64
-    binaries:
-      - cortextool
-    builds:
+    ids:
       - cortextool-linux
     dockerfile: cmd/cortextool/GR.Dockerfile
     image_templates:
@@ -81,3 +85,15 @@ dockers:
     - "--label=org.opencontainers.image.version={{.Version}}"
     - "--label=repository=https://github.com/grafana/cortex-tools"
     - "--label=homepage=https://grafana.com"
+brews:
+  -
+    tap:
+      owner: grafana
+      name: homebrew-grafana
+    commit_author:
+      name: cortex-tools-ci
+      email: support@grafana.com
+    homepage:  https://grafana.com
+    description: Tools for interacting with Cortex
+    install: |
+      bin.install "cortextool"

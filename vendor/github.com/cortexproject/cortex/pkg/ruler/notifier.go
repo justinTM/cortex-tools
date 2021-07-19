@@ -2,6 +2,7 @@ package ruler
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -14,11 +15,22 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
-	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/discovery/dns"
-	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/notifier"
+
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/tls"
 )
+
+type NotifierConfig struct {
+	TLS       tls.ClientConfig `yaml:",inline"`
+	BasicAuth util.BasicAuth   `yaml:",inline"`
+}
+
+func (cfg *NotifierConfig) RegisterFlags(f *flag.FlagSet) {
+	cfg.TLS.RegisterFlagsWithPrefix("ruler.alertmanager-client", f)
+	cfg.BasicAuth.RegisterFlagsWithPrefix("ruler.alertmanager-client.", f)
+}
 
 // rulerNotifier bundles a notifier.Manager together with an associated
 // Alertmanager service discovery manager and handles the lifecycle
@@ -41,6 +53,7 @@ func newRulerNotifier(o *notifier.Options, l gklog.Logger) *rulerNotifier {
 	}
 }
 
+// run starts the notifier. This function doesn't block and returns immediately.
 func (rn *rulerNotifier) run() {
 	rn.wg.Add(2)
 	go func() {
@@ -60,9 +73,9 @@ func (rn *rulerNotifier) applyConfig(cfg *config.Config) error {
 		return err
 	}
 
-	sdCfgs := make(map[string]sd_config.ServiceDiscoveryConfig)
+	sdCfgs := make(map[string]discovery.Configs)
 	for k, v := range cfg.AlertingConfig.AlertmanagerConfigs.ToMap() {
-		sdCfgs[k] = v.ServiceDiscoveryConfig
+		sdCfgs[k] = v.ServiceDiscoveryConfigs
 	}
 	return rn.sdManager.ApplyConfig(sdCfgs)
 }
@@ -124,37 +137,60 @@ func buildNotifierConfig(rulerConfig *Config) (*config.Config, error) {
 }
 
 func amConfigFromURL(rulerConfig *Config, url *url.URL, apiVersion config.AlertmanagerAPIVersion) *config.AlertmanagerConfig {
-	var sdConfig sd_config.ServiceDiscoveryConfig
+	var sdConfig discovery.Configs
 	if rulerConfig.AlertmanagerDiscovery {
-		sdConfig.DNSSDConfigs = []*dns.SDConfig{{
-			Names:           []string{url.Host},
-			RefreshInterval: model.Duration(rulerConfig.AlertmanagerRefreshInterval),
-			Type:            "SRV",
-			Port:            0, // Ignored, because of SRV.
-		}}
+		sdConfig = discovery.Configs{
+			&dns.SDConfig{
+				Names:           []string{url.Host},
+				RefreshInterval: model.Duration(rulerConfig.AlertmanagerRefreshInterval),
+				Type:            "SRV",
+				Port:            0, // Ignored, because of SRV.
+			},
+		}
+
 	} else {
-		sdConfig.StaticConfigs = []*targetgroup.Group{{
-			Targets: []model.LabelSet{{model.AddressLabel: model.LabelValue(url.Host)}},
-		}}
+		sdConfig = discovery.Configs{
+			discovery.StaticConfig{
+				{
+					Targets: []model.LabelSet{{model.AddressLabel: model.LabelValue(url.Host)}},
+				},
+			},
+		}
 	}
 
 	amConfig := &config.AlertmanagerConfig{
-		APIVersion:             apiVersion,
-		Scheme:                 url.Scheme,
-		PathPrefix:             url.Path,
-		Timeout:                model.Duration(rulerConfig.NotificationTimeout),
-		ServiceDiscoveryConfig: sdConfig,
+		APIVersion:              apiVersion,
+		Scheme:                  url.Scheme,
+		PathPrefix:              url.Path,
+		Timeout:                 model.Duration(rulerConfig.NotificationTimeout),
+		ServiceDiscoveryConfigs: sdConfig,
+		HTTPClientConfig: config_util.HTTPClientConfig{
+			TLSConfig: config_util.TLSConfig{
+				CAFile:             rulerConfig.Notifier.TLS.CAPath,
+				CertFile:           rulerConfig.Notifier.TLS.CertPath,
+				KeyFile:            rulerConfig.Notifier.TLS.KeyPath,
+				InsecureSkipVerify: rulerConfig.Notifier.TLS.InsecureSkipVerify,
+				ServerName:         rulerConfig.Notifier.TLS.ServerName,
+			},
+		},
 	}
 
+	// Check the URL for basic authentication information first
 	if url.User != nil {
-		amConfig.HTTPClientConfig = config_util.HTTPClientConfig{
-			BasicAuth: &config_util.BasicAuth{
-				Username: url.User.Username(),
-			},
+		amConfig.HTTPClientConfig.BasicAuth = &config_util.BasicAuth{
+			Username: url.User.Username(),
 		}
 
 		if password, isSet := url.User.Password(); isSet {
 			amConfig.HTTPClientConfig.BasicAuth.Password = config_util.Secret(password)
+		}
+	}
+
+	// Override URL basic authentication configs with hard coded config values if present
+	if rulerConfig.Notifier.BasicAuth.IsEnabled() {
+		amConfig.HTTPClientConfig.BasicAuth = &config_util.BasicAuth{
+			Username: rulerConfig.Notifier.BasicAuth.Username,
+			Password: config_util.Secret(rulerConfig.Notifier.BasicAuth.Password),
 		}
 	}
 

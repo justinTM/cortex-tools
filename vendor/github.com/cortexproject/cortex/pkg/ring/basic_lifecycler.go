@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/cortexproject/cortex/pkg/ring/kv"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/services"
 )
 
@@ -21,7 +21,7 @@ type BasicLifecyclerDelegate interface {
 	// OnRingInstanceRegister is called while the lifecycler is registering the
 	// instance within the ring and should return the state and set of tokens to
 	// use for the instance itself.
-	OnRingInstanceRegister(lifecycler *BasicLifecycler, ringDesc Desc, instanceExists bool, instanceID string, instanceDesc IngesterDesc) (IngesterState, Tokens)
+	OnRingInstanceRegister(lifecycler *BasicLifecycler, ringDesc Desc, instanceExists bool, instanceID string, instanceDesc InstanceDesc) (InstanceState, Tokens)
 
 	// OnRingInstanceTokens is called once the instance tokens are set and are
 	// stable within the ring (honoring the observe period, if set).
@@ -34,7 +34,7 @@ type BasicLifecyclerDelegate interface {
 
 	// OnRingInstanceHeartbeat is called while the instance is updating its heartbeat
 	// in the ring.
-	OnRingInstanceHeartbeat(lifecycler *BasicLifecycler, ringDesc *Desc, instanceDesc *IngesterDesc)
+	OnRingInstanceHeartbeat(lifecycler *BasicLifecycler, ringDesc *Desc, instanceDesc *InstanceDesc)
 }
 
 type BasicLifecyclerConfig struct {
@@ -77,7 +77,7 @@ type BasicLifecycler struct {
 
 	// The current instance state.
 	currState        sync.RWMutex
-	currInstanceDesc *IngesterDesc
+	currInstanceDesc *InstanceDesc
 }
 
 // NewBasicLifecycler makes a new BasicLifecycler.
@@ -111,7 +111,7 @@ func (l *BasicLifecycler) GetInstanceZone() string {
 	return l.cfg.Zone
 }
 
-func (l *BasicLifecycler) GetState() IngesterState {
+func (l *BasicLifecycler) GetState() InstanceState {
 	l.currState.RLock()
 	defer l.currState.RUnlock()
 
@@ -133,6 +133,16 @@ func (l *BasicLifecycler) GetTokens() Tokens {
 	return l.currInstanceDesc.GetTokens()
 }
 
+// GetRegisteredAt returns the timestamp when the instance has been registered to the ring
+// or a zero value if the lifecycler hasn't been started yet or was already registered and its
+// timestamp is unknown.
+func (l *BasicLifecycler) GetRegisteredAt() time.Time {
+	l.currState.RLock()
+	defer l.currState.RUnlock()
+
+	return l.currInstanceDesc.GetRegisteredAt()
+}
+
 // IsRegistered returns whether the instance is currently registered within the ring.
 func (l *BasicLifecycler) IsRegistered() bool {
 	l.currState.RLock()
@@ -141,7 +151,7 @@ func (l *BasicLifecycler) IsRegistered() bool {
 	return l.currInstanceDesc != nil
 }
 
-func (l *BasicLifecycler) ChangeState(ctx context.Context, state IngesterState) error {
+func (l *BasicLifecycler) ChangeState(ctx context.Context, state InstanceState) error {
 	return l.run(func() error {
 		return l.changeState(ctx, state)
 	})
@@ -184,7 +194,7 @@ func (l *BasicLifecycler) running(ctx context.Context) error {
 			f()
 
 		case <-ctx.Done():
-			level.Info(util.Logger).Log("msg", "ring lifecycler is shutting down", "ring", l.ringName)
+			level.Info(util_log.Logger).Log("msg", "ring lifecycler is shutting down", "ring", l.ringName)
 			return nil
 		}
 	}
@@ -229,7 +239,7 @@ heartbeatLoop:
 // registerInstance registers the instance in the ring. The initial state and set of tokens
 // depends on the OnRingInstanceRegister() delegate function.
 func (l *BasicLifecycler) registerInstance(ctx context.Context) error {
-	var instanceDesc IngesterDesc
+	var instanceDesc InstanceDesc
 
 	err := l.store.CAS(ctx, l.ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
 		ringDesc := GetOrCreateRingDesc(in)
@@ -237,7 +247,7 @@ func (l *BasicLifecycler) registerInstance(ctx context.Context) error {
 		var exists bool
 		instanceDesc, exists = ringDesc.Ingesters[l.cfg.ID]
 		if exists {
-			level.Info(l.logger).Log("msg", "instance found in the ring", "instance", l.cfg.ID, "ring", l.ringName, "state", instanceDesc.GetState(), "tokens", len(instanceDesc.GetTokens()))
+			level.Info(l.logger).Log("msg", "instance found in the ring", "instance", l.cfg.ID, "ring", l.ringName, "state", instanceDesc.GetState(), "tokens", len(instanceDesc.GetTokens()), "registered_at", instanceDesc.GetRegisteredAt().String())
 		} else {
 			level.Info(l.logger).Log("msg", "instance not found in the ring", "instance", l.cfg.ID, "ring", l.ringName)
 		}
@@ -248,15 +258,25 @@ func (l *BasicLifecycler) registerInstance(ctx context.Context) error {
 		// Ensure tokens are sorted.
 		sort.Sort(tokens)
 
+		// If the instance didn't already exist, then we can safely set the registered timestamp to "now",
+		// otherwise we have to honor the previous value (even if it was zero, because means it was unknown
+		// but it's definitely not "now").
+		var registeredAt time.Time
+		if exists {
+			registeredAt = instanceDesc.GetRegisteredAt()
+		} else {
+			registeredAt = time.Now()
+		}
+
 		if !exists {
-			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state)
+			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state, registeredAt)
 			return ringDesc, true, nil
 		}
 
 		// Always overwrite the instance in the ring (even if already exists) because some properties
 		// may have changed (stated, tokens, zone, address) and even if they didn't the heartbeat at
 		// least did.
-		instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state)
+		instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state, registeredAt)
 		return ringDesc, true, nil
 	})
 
@@ -307,7 +327,7 @@ func (l *BasicLifecycler) waitStableTokens(ctx context.Context, period time.Dura
 func (l *BasicLifecycler) verifyTokens(ctx context.Context) bool {
 	result := false
 
-	err := l.updateInstance(ctx, func(r *Desc, i *IngesterDesc) bool {
+	err := l.updateInstance(ctx, func(r *Desc, i *InstanceDesc) bool {
 		// At this point, we should have the same tokens as we have registered before.
 		actualTokens, takenTokens := r.TokensFor(l.cfg.ID)
 
@@ -365,8 +385,8 @@ func (l *BasicLifecycler) unregisterInstance(ctx context.Context) error {
 	return nil
 }
 
-func (l *BasicLifecycler) updateInstance(ctx context.Context, update func(*Desc, *IngesterDesc) bool) error {
-	var instanceDesc IngesterDesc
+func (l *BasicLifecycler) updateInstance(ctx context.Context, update func(*Desc, *InstanceDesc) bool) error {
+	var instanceDesc InstanceDesc
 
 	err := l.store.CAS(ctx, l.ringKey, func(in interface{}) (out interface{}, retry bool, err error) {
 		ringDesc := GetOrCreateRingDesc(in)
@@ -378,7 +398,7 @@ func (l *BasicLifecycler) updateInstance(ctx context.Context, update func(*Desc,
 		// or the instance has been forgotten. In this case, we do re-insert it.
 		if !ok {
 			level.Warn(l.logger).Log("msg", "instance missing in the ring, adding it back", "ring", l.ringName)
-			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, l.GetTokens(), l.GetState())
+			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, l.GetTokens(), l.GetState(), l.GetRegisteredAt())
 		}
 
 		prevTimestamp := instanceDesc.Timestamp
@@ -411,7 +431,7 @@ func (l *BasicLifecycler) updateInstance(ctx context.Context, update func(*Desc,
 // heartbeat updates the instance timestamp within the ring. This function is guaranteed
 // to be called within the lifecycler main goroutine.
 func (l *BasicLifecycler) heartbeat(ctx context.Context) {
-	err := l.updateInstance(ctx, func(r *Desc, i *IngesterDesc) bool {
+	err := l.updateInstance(ctx, func(r *Desc, i *InstanceDesc) bool {
 		l.delegate.OnRingInstanceHeartbeat(l, r, i)
 		i.Timestamp = time.Now().Unix()
 		return true
@@ -427,8 +447,8 @@ func (l *BasicLifecycler) heartbeat(ctx context.Context) {
 
 // changeState of the instance within the ring. This function is guaranteed
 // to be called within the lifecycler main goroutine.
-func (l *BasicLifecycler) changeState(ctx context.Context, state IngesterState) error {
-	err := l.updateInstance(ctx, func(_ *Desc, i *IngesterDesc) bool {
+func (l *BasicLifecycler) changeState(ctx context.Context, state InstanceState) error {
+	err := l.updateInstance(ctx, func(_ *Desc, i *InstanceDesc) bool {
 		// No-op if the state hasn't changed.
 		if i.State == state {
 			return false

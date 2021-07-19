@@ -8,11 +8,12 @@ import (
 	"io"
 	"io/ioutil"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/go-kit/kit/log/level"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/log"
 )
 
 type MockStorageMode int
@@ -52,6 +53,25 @@ func NewMockStorage() *MockStorage {
 		tables:  map[string]*mockTable{},
 		objects: map[string][]byte{},
 	}
+}
+
+func (m *MockStorage) GetSortedObjectKeys() []string {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	keys := make([]string, 0, len(m.objects))
+	for k := range m.objects {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (m *MockStorage) GetObjectCount() int {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	return len(m.objects)
 }
 
 // Stop doesn't do anything.
@@ -173,7 +193,7 @@ func (m *MockStorage) BatchWrite(ctx context.Context, batch WriteBatch) error {
 		}
 		seenWrites[key] = true
 
-		level.Debug(util.WithContext(ctx, util.Logger)).Log("msg", "write", "hash", req.hashValue, "range", req.rangeValue)
+		level.Debug(log.WithContext(ctx, log.Logger)).Log("msg", "write", "hash", req.hashValue, "range", req.rangeValue)
 
 		items := table.items[req.hashValue]
 
@@ -246,7 +266,7 @@ func (m *MockStorage) QueryPages(ctx context.Context, queries []IndexQuery, call
 }
 
 func (m *MockStorage) query(ctx context.Context, query IndexQuery, callback func(ReadBatch) (shouldContinue bool)) error {
-	logger := util.WithContext(ctx, util.Logger)
+	logger := log.WithContext(ctx, log.Logger)
 	level.Debug(logger).Log("msg", "QueryPages", "query", query.HashValue)
 
 	table, ok := m.tables[query.TableName]
@@ -425,7 +445,8 @@ func (m *MockStorage) DeleteObject(ctx context.Context, objectKey string) error 
 	return nil
 }
 
-func (m *MockStorage) List(ctx context.Context, prefix string) ([]StorageObject, []StorageCommonPrefix, error) {
+// List implements chunk.ObjectClient.
+func (m *MockStorage) List(ctx context.Context, prefix, delimiter string) ([]StorageObject, []StorageCommonPrefix, error) {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
@@ -433,17 +454,44 @@ func (m *MockStorage) List(ctx context.Context, prefix string) ([]StorageObject,
 		return nil, nil, errPermissionDenied
 	}
 
+	prefixes := map[string]struct{}{}
+
 	storageObjects := make([]StorageObject, 0, len(m.objects))
 	for key := range m.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+
 		// ToDo: Store mtime when we have mtime based use-cases for storage objects
-		storageObjects = append(storageObjects, StorageObject{Key: key})
+		if delimiter == "" {
+			storageObjects = append(storageObjects, StorageObject{Key: key})
+			continue
+		}
+
+		ix := strings.Index(key[len(prefix):], delimiter)
+		if ix < 0 {
+			storageObjects = append(storageObjects, StorageObject{Key: key})
+			continue
+		}
+
+		commonPrefix := key[:len(prefix)+ix+len(delimiter)] // Include delimeter in the common prefix.
+		prefixes[commonPrefix] = struct{}{}
 	}
 
-	return storageObjects, []StorageCommonPrefix{}, nil
-}
+	var commonPrefixes = []StorageCommonPrefix(nil)
+	for p := range prefixes {
+		commonPrefixes = append(commonPrefixes, StorageCommonPrefix(p))
+	}
 
-func (m *MockStorage) PathSeparator() string {
-	return DirDelim
+	// Object stores return results in sorted order.
+	sort.Slice(storageObjects, func(i, j int) bool {
+		return storageObjects[i].Key < storageObjects[j].Key
+	})
+	sort.Slice(commonPrefixes, func(i, j int) bool {
+		return commonPrefixes[i] < commonPrefixes[j]
+	})
+
+	return storageObjects, commonPrefixes, nil
 }
 
 type mockWriteBatch struct {

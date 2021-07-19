@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"net/url"
 
@@ -20,12 +21,14 @@ func (r *CortexClient) CreateRuleGroup(ctx context.Context, namespace string, rg
 	}
 
 	escapedNamespace := url.PathEscape(namespace)
-	res, err := r.doRequest("/api/prom/rules/"+escapedNamespace, "POST", payload)
+	path := r.apiPath + "/" + escapedNamespace
+
+	res, err := r.doRequest(path, "POST", payload)
 	if err != nil {
 		return err
 	}
 
-	defer res.Body.Close()
+	res.Body.Close()
 
 	return nil
 }
@@ -34,21 +37,25 @@ func (r *CortexClient) CreateRuleGroup(ctx context.Context, namespace string, rg
 func (r *CortexClient) DeleteRuleGroup(ctx context.Context, namespace, groupName string) error {
 	escapedNamespace := url.PathEscape(namespace)
 	escapedGroupName := url.PathEscape(groupName)
+	path := r.apiPath + "/" + escapedNamespace + "/" + escapedGroupName
 
-	_, err := r.doRequest("/api/prom/rules/"+escapedNamespace+"/"+escapedGroupName, "DELETE", nil)
-	return err
+	res, err := r.doRequest(path, "DELETE", nil)
+	if err != nil {
+		return err
+	}
+
+	res.Body.Close()
+
+	return nil
 }
 
 // GetRuleGroup retrieves a rule group
 func (r *CortexClient) GetRuleGroup(ctx context.Context, namespace, groupName string) (*rwrulefmt.RuleGroup, error) {
 	escapedNamespace := url.PathEscape(namespace)
 	escapedGroupName := url.PathEscape(groupName)
-	path := "/api/prom/rules/" + escapedNamespace + "/" + escapedGroupName
+	path := r.apiPath + "/" + escapedNamespace + "/" + escapedGroupName
 
-	log.WithFields(log.Fields{
-		"url": path,
-	}).Debugln("path built to request rule group")
-
+	fmt.Println(path)
 	res, err := r.doRequest(path, "GET", nil)
 	if err != nil {
 		return nil, err
@@ -76,7 +83,7 @@ func (r *CortexClient) GetRuleGroup(ctx context.Context, namespace, groupName st
 
 // ListRules retrieves a rule group
 func (r *CortexClient) ListRules(ctx context.Context, namespace string) (map[string][]rwrulefmt.RuleGroup, error) {
-	path := "/api/prom/rules"
+	path := r.apiPath
 	if namespace != "" {
 		path = path + "/" + namespace
 	}

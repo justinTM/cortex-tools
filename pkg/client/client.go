@@ -1,17 +1,24 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/util/tls"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+)
+
+const (
+	rulerAPIPath  = "/api/v1/rules"
+	legacyAPIPath = "/api/prom/rules"
 )
 
 var (
@@ -21,18 +28,22 @@ var (
 
 // Config is used to configure a Ruler Client
 type Config struct {
-	Key     string `yaml:"key"`
-	Address string `yaml:"address"`
-	ID      string `yaml:"id"`
-	TLS     tls.ClientConfig
+	User            string `yaml:"user"`
+	Key             string `yaml:"key"`
+	Address         string `yaml:"address"`
+	ID              string `yaml:"id"`
+	TLS             tls.ClientConfig
+	UseLegacyRoutes bool `yaml:"use_legacy_routes"`
 }
 
 // CortexClient is used to get and load rules into a cortex ruler
 type CortexClient struct {
+	user     string
 	key      string
 	id       string
 	endpoint *url.URL
-	client   http.Client
+	Client   http.Client
+	apiPath  string
 }
 
 // New returns a new Client
@@ -65,11 +76,18 @@ func New(cfg Config) (*CortexClient, error) {
 		client = http.Client{Transport: transport}
 	}
 
+	path := rulerAPIPath
+	if cfg.UseLegacyRoutes {
+		path = legacyAPIPath
+	}
+
 	return &CortexClient{
+		user:     cfg.User,
 		key:      cfg.Key,
 		id:       cfg.ID,
 		endpoint: endpoint,
-		client:   client,
+		Client:   client,
+		apiPath:  path,
 	}, nil
 }
 
@@ -88,12 +106,14 @@ func (r *CortexClient) Query(ctx context.Context, query string) (*http.Response,
 }
 
 func (r *CortexClient) doRequest(path, method string, payload []byte) (*http.Response, error) {
-	req, err := http.NewRequest(method, r.endpoint.String()+path, bytes.NewBuffer(payload))
+	req, err := buildRequest(path, method, *r.endpoint, payload)
 	if err != nil {
 		return nil, err
 	}
 
-	if r.key != "" {
+	if r.user != "" {
+		req.SetBasicAuth(r.user, r.key)
+	} else if r.key != "" {
 		req.SetBasicAuth(r.id, r.key)
 	}
 
@@ -104,7 +124,7 @@ func (r *CortexClient) doRequest(path, method string, payload []byte) (*http.Res
 		"method": req.Method,
 	}).Debugln("sending request to cortex api")
 
-	resp, err := r.client.Do(req)
+	resp, err := r.Client.Do(req)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"url":    req.URL.String(),
@@ -131,26 +151,51 @@ func checkResponse(r *http.Response) error {
 		return nil
 	}
 
-	var msg string
-	data, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		msg = fmt.Sprintf("unable to decode body, %s", err.Error())
+	var msg, errMsg string
+	scanner := bufio.NewScanner(io.LimitReader(r.Body, 512))
+	if scanner.Scan() {
+		msg = scanner.Text()
+	}
+
+	if msg == "" {
+		errMsg = fmt.Sprintf("server returned HTTP status %s", r.Status)
 	} else {
-		msg = fmt.Sprintf("request failed with response body %v", string(data))
+		errMsg = fmt.Sprintf("server returned HTTP status %s: %s", r.Status, msg)
 	}
 
 	if r.StatusCode == http.StatusNotFound {
 		log.WithFields(log.Fields{
 			"status": r.Status,
 			"msg":    msg,
-		}).Debugln("resource not found")
+		}).Debugln(errMsg)
 		return ErrResourceNotFound
 	}
 
 	log.WithFields(log.Fields{
 		"status": r.Status,
 		"msg":    msg,
-	}).Errorln("requests failed")
+	}).Errorln(errMsg)
 
-	return errors.New("failed request to the cortex api")
+	return errors.New(errMsg)
+}
+
+func joinPath(baseURLPath, targetPath string) string {
+	// trim exactly one slash at the end of the base URL, this expects target
+	// path to always start with a slash
+	return strings.TrimSuffix(baseURLPath, "/") + targetPath
+}
+
+func buildRequest(p, m string, endpoint url.URL, payload []byte) (*http.Request, error) {
+	// parse path parameter again (as it already contains escaped path information
+	pURL, err := url.Parse(p)
+	if err != nil {
+		return nil, err
+	}
+
+	// if path or endpoint contains escaping that requires RawPath to be populated, also join rawPath
+	if pURL.RawPath != "" || endpoint.RawPath != "" {
+		endpoint.RawPath = joinPath(endpoint.EscapedPath(), pURL.EscapedPath())
+	}
+	endpoint.Path = joinPath(endpoint.Path, pURL.Path)
+	return http.NewRequest(m, endpoint.String(), bytes.NewBuffer(payload))
 }

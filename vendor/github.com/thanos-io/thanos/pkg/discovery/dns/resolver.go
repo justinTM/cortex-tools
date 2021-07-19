@@ -9,6 +9,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
+
 	"github.com/pkg/errors"
 )
 
@@ -34,15 +37,17 @@ type Resolver interface {
 type ipLookupResolver interface {
 	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
 	LookupSRV(ctx context.Context, service, proto, name string) (cname string, addrs []*net.SRV, err error)
+	IsNotFound(err error) bool
 }
 
 type dnsSD struct {
 	resolver ipLookupResolver
+	logger   log.Logger
 }
 
 // NewResolver creates a resolver with given underlying resolver.
-func NewResolver(resolver ipLookupResolver) Resolver {
-	return &dnsSD{resolver: resolver}
+func NewResolver(resolver ipLookupResolver, logger log.Logger) Resolver {
+	return &dnsSD{resolver: resolver, logger: logger}
 }
 
 func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string, error) {
@@ -71,7 +76,15 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 		}
 		ips, err := s.resolver.LookupIPAddr(ctx, host)
 		if err != nil {
-			return nil, errors.Wrapf(err, "lookup IP addresses %q", host)
+			// We exclude error from std Golang resolver for the case of the domain (e.g `NXDOMAIN`) not being found by DNS
+			// server. Since `miekg` does not consider this as an error,  when the host cannot be found, empty slice will be
+			// returned.
+			if !s.resolver.IsNotFound(err) {
+				return nil, errors.Wrapf(err, "lookup IP addresses %q", host)
+			}
+			if ips == nil {
+				level.Error(s.logger).Log("msg", "failed to lookup IP addresses", "host", host, "err", err)
+			}
 		}
 		for _, ip := range ips {
 			res = append(res, appendScheme(scheme, net.JoinHostPort(ip.String(), port)))
@@ -79,7 +92,12 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 	case SRV, SRVNoA:
 		_, recs, err := s.resolver.LookupSRV(ctx, "", "", host)
 		if err != nil {
-			return nil, errors.Wrapf(err, "lookup SRV records %q", host)
+			if !s.resolver.IsNotFound(err) {
+				return nil, errors.Wrapf(err, "lookup SRV records %q", host)
+			}
+			if len(recs) == 0 {
+				level.Error(s.logger).Log("msg", "failed to lookup SRV records", "host", host, "err", err)
+			}
 		}
 
 		for _, rec := range recs {
@@ -96,7 +114,12 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 			// Do A lookup for the domain in SRV answer.
 			resIPs, err := s.resolver.LookupIPAddr(ctx, rec.Target)
 			if err != nil {
-				return nil, errors.Wrapf(err, "look IP addresses %q", rec.Target)
+				if !s.resolver.IsNotFound(err) {
+					return nil, errors.Wrapf(err, "lookup IP addresses %q", host)
+				}
+				if len(resIPs) == 0 {
+					level.Error(s.logger).Log("msg", "failed to lookup IP addresses", "host", host, "err", err)
+				}
 			}
 			for _, resIP := range resIPs {
 				res = append(res, appendScheme(scheme, net.JoinHostPort(resIP.String(), resPort)))
@@ -104,6 +127,10 @@ func (s *dnsSD) Resolve(ctx context.Context, name string, qtype QType) ([]string
 		}
 	default:
 		return nil, errors.Errorf("invalid lookup scheme %q", qtype)
+	}
+
+	if res == nil && err == nil {
+		level.Warn(s.logger).Log("msg", "IP address lookup yielded no results. No host found or no addresses found", "host", host)
 	}
 
 	return res, nil

@@ -1,16 +1,51 @@
 # Changelog
 
-> :heart: [**Uptrace.dev** - distributed traces, logs, and errors in one place](https://uptrace.dev)
+> :heart:
+> [**Uptrace.dev** - All-in-one tool to optimize performance and monitor errors & logs](https://uptrace.dev)
 
-## v8 (unreleased)
+## v8.9
+
+- Changed `PubSub.Channel` to only rely on `Ping` result. You can now use `WithChannelSize`,
+  `WithChannelHealthCheckInterval`, and `WithChannelSendTimeout` to override default settings.
+
+## v8.8
+
+- To make updating easier, extra modules now have the same version as go-redis does. That means that
+  you need to update your imports:
+
+```
+github.com/go-redis/redis/extra/redisotel -> github.com/go-redis/redis/extra/redisotel/v8
+github.com/go-redis/redis/extra/rediscensus -> github.com/go-redis/redis/extra/rediscensus/v8
+```
+
+## v8.5
+
+- [knadh](https://github.com/knadh) contributed long-awaited ability to scan Redis Hash into a
+  struct:
+
+```go
+err := rdb.HGetAll(ctx, "hash").Scan(&data)
+
+err := rdb.MGet(ctx, "key1", "key2").Scan(&data)
+```
+
+- Please check [redismock](https://github.com/go-redis/redismock) by
+  [monkey92t](https://github.com/monkey92t) if you are looking for mocking Redis Client.
+
+## v8
 
 - All commands require `context.Context` as a first argument, e.g. `rdb.Ping(ctx)`. If you are not
   using `context.Context` yet, the simplest option is to define global package variable
   `var ctx = context.TODO()` and use it when `ctx` is required.
-- `Cluster.ForEachNode` is renamed to `ForEachShard` for consistency with `Ring`.
+
+- Full support for `context.Context` canceling.
+
+- Added `redis.NewFailoverClusterClient` that supports routing read-only commands to a slave node.
 
 - Added `redisext.OpenTemetryHook` that adds
   [Redis OpenTelemetry instrumentation](https://redis.uptrace.dev/tracing/).
+
+- Redis slow log support.
 
 - Ring uses Rendezvous Hashing by default which provides better distribution. You need to move
   existing keys to a new location or keys will be inaccessible / lost. To use old hashing scheme:
@@ -24,6 +59,11 @@ ring := redis.NewRing(&redis.RingOptions{
     },
 })
 ```
+
+- `ClusterOptions.MaxRedirects` default value is changed from 8 to 3.
+- `Options.MaxRetries` default value is changed from 0 to 3.
+
+- `Cluster.ForEachNode` is renamed to `ForEachShard` for consistency with `Ring`.
 
 ## v7.3
 

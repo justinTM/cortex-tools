@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -16,8 +17,10 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
+	"github.com/cortexproject/cortex/pkg/chunk/encoding"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/extract"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/cortexproject/cortex/pkg/util/validation"
 )
@@ -54,9 +57,6 @@ type StoreConfig struct {
 
 	CacheLookupsOlderThan model.Duration `yaml:"cache_lookups_older_than"`
 
-	// Limits query start time to be greater than now() - MaxLookBackPeriod, if set.
-	MaxLookBackPeriod model.Duration `yaml:"max_look_back_period"`
-
 	// Not visible in yaml because the setting shouldn't be common between ingesters and queriers.
 	// This exists in case we don't want to cache all the chunks but still want to take advantage of
 	// ingester chunk write deduplication. But for the queriers we need the full value. So when this option
@@ -74,10 +74,10 @@ func (cfg *StoreConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.WriteDedupeCacheConfig.RegisterFlagsWithPrefix("store.index-cache-write.", "Cache config for index entry writing. ", f)
 
 	f.Var(&cfg.CacheLookupsOlderThan, "store.cache-lookups-older-than", "Cache index entries older than this period. 0 to disable.")
-	f.Var(&cfg.MaxLookBackPeriod, "store.max-look-back-period", "Limit how long back data can be queried")
 }
 
-func (cfg *StoreConfig) Validate() error {
+// Validate validates the store config.
+func (cfg *StoreConfig) Validate(logger log.Logger) error {
 	if err := cfg.ChunkCacheConfig.Validate(); err != nil {
 		return err
 	}
@@ -138,7 +138,7 @@ func newStore(cfg StoreConfig, schema StoreSchema, index IndexClient, chunks Cli
 	}, nil
 }
 
-// Put implements ChunkStore
+// Put implements Store
 func (c *store) Put(ctx context.Context, chunks []Chunk) error {
 	for _, chunk := range chunks {
 		if err := c.PutOne(ctx, chunk.From, chunk.Through, chunk); err != nil {
@@ -148,7 +148,7 @@ func (c *store) Put(ctx context.Context, chunks []Chunk) error {
 	return nil
 }
 
-// PutOne implements ChunkStore
+// PutOne implements Store
 func (c *store) PutOne(ctx context.Context, from, through model.Time, chunk Chunk) error {
 	log, ctx := spanlogger.New(ctx, "ChunkStore.PutOne")
 	defer log.Finish()
@@ -245,7 +245,7 @@ func (c *baseStore) LabelValuesForMetricName(ctx context.Context, userID string,
 
 	var result UniqueStrings
 	for _, entry := range entries {
-		_, labelValue, _, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
+		_, labelValue, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -309,13 +309,6 @@ func (c *baseStore) validateQueryTimeRange(ctx context.Context, userID string, f
 		return true, nil
 	}
 
-	if c.cfg.MaxLookBackPeriod != 0 {
-		oldestStartTime := model.Now().Add(-time.Duration(c.cfg.MaxLookBackPeriod))
-		if oldestStartTime.After(*from) {
-			*from = oldestStartTime
-		}
-	}
-
 	if through.After(now.Add(5 * time.Minute)) {
 		// time-span end is in future ... regard as legal
 		level.Info(log).Log("msg", "adjusting end timerange from future to now", "old_through", through, "new_through", now)
@@ -362,7 +355,7 @@ func (c *store) getMetricNameChunks(ctx context.Context, userID string, from, th
 	filtered := filterChunksByTime(from, through, chunks)
 	level.Debug(log).Log("Chunks post filtering", len(chunks))
 
-	maxChunksPerQuery := c.limits.MaxChunksPerQuery(userID)
+	maxChunksPerQuery := c.limits.MaxChunksPerQueryFromStore(userID)
 	if maxChunksPerQuery > 0 && len(filtered) > maxChunksPerQuery {
 		err := QueryError(fmt.Sprintf("Query %v fetched too many chunks (%d > %d)", allMatchers, len(filtered), maxChunksPerQuery))
 		level.Error(log).Log("err", err)
@@ -449,7 +442,8 @@ func (c *store) lookupChunksByMetricName(ctx context.Context, userID string, fro
 }
 
 func (c *baseStore) lookupIdsByMetricNameMatcher(ctx context.Context, from, through model.Time, userID, metricName string, matcher *labels.Matcher, filter func([]IndexQuery) []IndexQuery) ([]string, error) {
-	log, ctx := spanlogger.New(ctx, "Store.lookupIdsByMetricNameMatcher", "metricName", metricName, "matcher", formatMatcher(matcher))
+	formattedMatcher := formatMatcher(matcher)
+	log, ctx := spanlogger.New(ctx, "Store.lookupIdsByMetricNameMatcher", "metricName", metricName, "matcher", formattedMatcher)
 	defer log.Span.Finish()
 
 	var err error
@@ -467,11 +461,11 @@ func (c *baseStore) lookupIdsByMetricNameMatcher(ctx context.Context, from, thro
 	if err != nil {
 		return nil, err
 	}
-	level.Debug(log).Log("matcher", formatMatcher(matcher), "queries", len(queries))
+	level.Debug(log).Log("matcher", formattedMatcher, "queries", len(queries))
 
 	if filter != nil {
 		queries = filter(queries)
-		level.Debug(log).Log("matcher", formatMatcher(matcher), "filteredQueries", len(queries))
+		level.Debug(log).Log("matcher", formattedMatcher, "filteredQueries", len(queries))
 	}
 
 	entries, err := c.lookupEntriesByQueries(ctx, queries)
@@ -482,13 +476,13 @@ func (c *baseStore) lookupIdsByMetricNameMatcher(ctx context.Context, from, thro
 	} else if err != nil {
 		return nil, err
 	}
-	level.Debug(log).Log("matcher", formatMatcher(matcher), "entries", len(entries))
+	level.Debug(log).Log("matcher", formattedMatcher, "entries", len(entries))
 
 	ids, err := c.parseIndexEntries(ctx, entries, matcher)
 	if err != nil {
 		return nil, err
 	}
-	level.Debug(log).Log("matcher", formatMatcher(matcher), "ids", len(ids))
+	level.Debug(log).Log("matcher", formattedMatcher, "ids", len(ids))
 
 	return ids, nil
 }
@@ -529,7 +523,7 @@ func (c *baseStore) lookupEntriesByQueries(ctx context.Context, queries []IndexQ
 		return true
 	})
 	if err != nil {
-		level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "error querying storage", "err", err)
+		level.Error(util_log.WithContext(ctx, util_log.Logger)).Log("msg", "error querying storage", "err", err)
 	}
 	return entries, err
 }
@@ -550,7 +544,7 @@ func (c *baseStore) parseIndexEntries(_ context.Context, entries []IndexEntry, m
 
 	result := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		chunkKey, labelValue, _, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
+		chunkKey, labelValue, err := parseChunkTimeRangeValue(entry.RangeValue, entry.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -676,7 +670,7 @@ func (c *baseStore) reboundChunk(ctx context.Context, userID, chunkID string, pa
 	var newChunks []*Chunk
 	if partiallyDeletedInterval.Start > chunk.From {
 		newChunk, err := chunk.Slice(chunk.From, partiallyDeletedInterval.Start-1)
-		if err != nil && err != ErrSliceNoDataInRange {
+		if err != nil && err != encoding.ErrSliceNoDataInRange {
 			return errors.Wrapf(err, "when slicing chunk for interval %d - %d", chunk.From, partiallyDeletedInterval.Start-1)
 		}
 
@@ -687,7 +681,7 @@ func (c *baseStore) reboundChunk(ctx context.Context, userID, chunkID string, pa
 
 	if partiallyDeletedInterval.End < chunk.Through {
 		newChunk, err := chunk.Slice(partiallyDeletedInterval.End+1, chunk.Through)
-		if err != nil && err != ErrSliceNoDataInRange {
+		if err != nil && err != encoding.ErrSliceNoDataInRange {
 			return errors.Wrapf(err, "when slicing chunk for interval %d - %d", partiallyDeletedInterval.End+1, chunk.Through)
 		}
 

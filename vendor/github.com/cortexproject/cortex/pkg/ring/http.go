@@ -12,6 +12,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 
 	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/log"
 )
 
 const pageContent = `
@@ -33,6 +34,7 @@ const pageContent = `
 						<th>Availability Zone</th>
 						<th>State</th>
 						<th>Address</th>
+						<th>Registered At</th>
 						<th>Last Heartbeat</th>
 						<th>Tokens</th>
 						<th>Ownership</th>
@@ -50,7 +52,8 @@ const pageContent = `
 						<td>{{ .Zone }}</td>
 						<td>{{ .State }}</td>
 						<td>{{ .Address }}</td>
-						<td>{{ .Timestamp }}</td>
+						<td>{{ .RegisteredTimestamp }}</td>
+						<td>{{ .HeartbeatTimestamp }}</td>
 						<td>{{ .NumTokens }}</td>
 						<td>{{ .Ownership }}%</td>
 						<td><button name="forget" value="{{ .ID }}" type="submit">Forget</button></td>
@@ -105,7 +108,7 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodPost {
 		ingesterID := req.FormValue("forget")
 		if err := r.forget(req.Context(), ingesterID); err != nil {
-			level.Error(util.WithContext(req.Context(), util.Logger)).Log("msg", "error forgetting instance", "err", err)
+			level.Error(log.WithContext(req.Context(), log.Logger)).Log("msg", "error forgetting instance", "err", err)
 		}
 
 		// Implement PRG pattern to prevent double-POST and work with CSRF middleware.
@@ -129,34 +132,43 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	sort.Strings(ingesterIDs)
 
+	now := time.Now()
 	ingesters := []interface{}{}
-	_, owned := countTokens(r.ringDesc, r.ringTokens)
+	_, owned := r.countTokens()
 	for _, id := range ingesterIDs {
 		ing := r.ringDesc.Ingesters[id]
-		timestamp := time.Unix(ing.Timestamp, 0)
+		heartbeatTimestamp := time.Unix(ing.Timestamp, 0)
 		state := ing.State.String()
-		if !r.IsHealthy(&ing, Reporting) {
+		if !r.IsHealthy(&ing, Reporting, now) {
 			state = unhealthy
 		}
 
+		// Format the registered timestamp.
+		registeredTimestamp := ""
+		if ing.RegisteredTimestamp != 0 {
+			registeredTimestamp = ing.GetRegisteredAt().String()
+		}
+
 		ingesters = append(ingesters, struct {
-			ID        string   `json:"id"`
-			State     string   `json:"state"`
-			Address   string   `json:"address"`
-			Timestamp string   `json:"timestamp"`
-			Zone      string   `json:"zone"`
-			Tokens    []uint32 `json:"tokens"`
-			NumTokens int      `json:"-"`
-			Ownership float64  `json:"-"`
+			ID                  string   `json:"id"`
+			State               string   `json:"state"`
+			Address             string   `json:"address"`
+			HeartbeatTimestamp  string   `json:"timestamp"`
+			RegisteredTimestamp string   `json:"registered_timestamp"`
+			Zone                string   `json:"zone"`
+			Tokens              []uint32 `json:"tokens"`
+			NumTokens           int      `json:"-"`
+			Ownership           float64  `json:"-"`
 		}{
-			ID:        id,
-			State:     state,
-			Address:   ing.Addr,
-			Timestamp: timestamp.String(),
-			Tokens:    ing.Tokens,
-			Zone:      ing.Zone,
-			NumTokens: len(ing.Tokens),
-			Ownership: (float64(owned[id]) / float64(math.MaxUint32)) * 100,
+			ID:                  id,
+			State:               state,
+			Address:             ing.Addr,
+			HeartbeatTimestamp:  heartbeatTimestamp.String(),
+			RegisteredTimestamp: registeredTimestamp,
+			Tokens:              ing.Tokens,
+			Zone:                ing.Zone,
+			NumTokens:           len(ing.Tokens),
+			Ownership:           (float64(owned[id]) / float64(math.MaxUint32)) * 100,
 		})
 	}
 
@@ -168,7 +180,7 @@ func (r *Ring) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		ShowTokens bool          `json:"-"`
 	}{
 		Ingesters:  ingesters,
-		Now:        time.Now(),
+		Now:        now,
 		ShowTokens: tokensParam == "true",
 	}, pageTemplate, req)
 }

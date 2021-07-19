@@ -14,12 +14,12 @@ import (
 
 // StoreLimits helps get Limits specific to Queries for Stores
 type StoreLimits interface {
-	MaxChunksPerQuery(userID string) int
+	MaxChunksPerQueryFromStore(userID string) int
 	MaxQueryLength(userID string) time.Duration
 }
 
 type CacheGenNumLoader interface {
-	GetStoreCacheGenNumber(userID string) string
+	GetStoreCacheGenNumber(tenantIDs []string) string
 }
 
 // Store for chunks.
@@ -217,7 +217,7 @@ func (c compositeStore) forStores(ctx context.Context, userID string, from, thro
 		return nil
 	}
 
-	ctx = c.injectCacheGen(ctx, userID)
+	ctx = c.injectCacheGen(ctx, []string{userID})
 
 	// first, find the schema with the highest start _before or at_ from
 	i := sort.Search(len(c.stores), func(i int) bool {
@@ -262,10 +262,10 @@ func (c compositeStore) forStores(ctx context.Context, userID string, from, thro
 	return nil
 }
 
-func (c compositeStore) injectCacheGen(ctx context.Context, userID string) context.Context {
+func (c compositeStore) injectCacheGen(ctx context.Context, tenantIDs []string) context.Context {
 	if c.cacheGenNumLoader == nil {
 		return ctx
 	}
 
-	return cache.InjectCacheGenNumber(ctx, c.cacheGenNumLoader.GetStoreCacheGenNumber(userID))
+	return cache.InjectCacheGenNumber(ctx, c.cacheGenNumLoader.GetStoreCacheGenNumber(tenantIDs))
 }

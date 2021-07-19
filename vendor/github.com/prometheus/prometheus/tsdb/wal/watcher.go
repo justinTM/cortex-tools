@@ -29,6 +29,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/tsdb/record"
 )
@@ -45,6 +46,7 @@ const (
 // and it is left to the implementer to make sure they are safe.
 type WriteTo interface {
 	Append([]record.RefSample) bool
+	AppendExemplars([]record.RefExemplar) bool
 	StoreSeries([]record.RefSeries, int)
 	// SeriesReset is called after reading a checkpoint to allow the deletion
 	// of all series created in a segment lower than the argument.
@@ -65,6 +67,7 @@ type Watcher struct {
 	logger         log.Logger
 	walDir         string
 	lastCheckpoint string
+	sendExemplars  bool
 	metrics        *WatcherMetrics
 	readerMetrics  *LiveReaderMetrics
 
@@ -135,7 +138,7 @@ func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
 }
 
 // NewWatcher creates a new WAL watcher for a given WriteTo.
-func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logger log.Logger, name string, writer WriteTo, walDir string) *Watcher {
+func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logger log.Logger, name string, writer WriteTo, walDir string, sendExemplars bool) *Watcher {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -146,8 +149,10 @@ func NewWatcher(metrics *WatcherMetrics, readerMetrics *LiveReaderMetrics, logge
 		readerMetrics: readerMetrics,
 		walDir:        path.Join(walDir, "wal"),
 		name:          name,
-		quit:          make(chan struct{}),
-		done:          make(chan struct{}),
+		sendExemplars: sendExemplars,
+
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
 
 		MaxSegment: -1,
 	}
@@ -461,10 +466,11 @@ func (w *Watcher) garbageCollectSeries(segmentNum int) error {
 
 func (w *Watcher) readSegment(r *LiveReader, segmentNum int, tail bool) error {
 	var (
-		dec     record.Decoder
-		series  []record.RefSeries
-		samples []record.RefSample
-		send    []record.RefSample
+		dec       record.Decoder
+		series    []record.RefSeries
+		samples   []record.RefSample
+		send      []record.RefSample
+		exemplars []record.RefExemplar
 	)
 	for r.Next() && !isClosed(w.quit) {
 		rec := r.Record()
@@ -506,14 +512,28 @@ func (w *Watcher) readSegment(r *LiveReader, segmentNum int, tail bool) error {
 				send = send[:0]
 			}
 
+		case record.Exemplars:
+			// Skip if experimental "exemplars over remote write" is not enabled.
+			if !w.sendExemplars {
+				break
+			}
+			// If we're not tailing a segment we can ignore any exemplars records we see.
+			// This speeds up replay of the WAL significantly.
+			if !tail {
+				break
+			}
+			exemplars, err := dec.Exemplars(rec, exemplars[:0])
+			if err != nil {
+				w.recordDecodeFailsMetric.Inc()
+				return err
+			}
+			w.writer.AppendExemplars(exemplars)
+
 		case record.Tombstones:
-			// noop
-		case record.Invalid:
-			return errors.New("invalid record")
 
 		default:
+			// Could be corruption, or reading from a WAL from a newer Prometheus.
 			w.recordDecodeFailsMetric.Inc()
-			return errors.New("unknown TSDB record type")
 		}
 	}
 	return errors.Wrapf(r.Err(), "segment %d: %v", segmentNum, r.Err())
@@ -526,8 +546,6 @@ func (w *Watcher) SetStartTime(t time.Time) {
 
 func recordType(rt record.Type) string {
 	switch rt {
-	case record.Invalid:
-		return "invalid"
 	case record.Series:
 		return "series"
 	case record.Samples:

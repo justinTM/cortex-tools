@@ -9,21 +9,20 @@ import (
 	"io/ioutil"
 
 	"github.com/ncw/swift"
-	thanos "github.com/thanos-io/thanos/pkg/objstore/swift"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/util"
+	cortex_swift "github.com/cortexproject/cortex/pkg/storage/bucket/swift"
+	"github.com/cortexproject/cortex/pkg/util/log"
 )
 
 type SwiftObjectClient struct {
-	conn      *swift.Connection
-	cfg       SwiftConfig
-	delimiter rune
+	conn *swift.Connection
+	cfg  SwiftConfig
 }
 
 // SwiftConfig is config for the Swift Chunk Client.
 type SwiftConfig struct {
-	thanos.SwiftConfig `yaml:",inline"`
+	cortex_swift.Config `yaml:",inline"`
 }
 
 // RegisterFlags registers flags.
@@ -38,42 +37,30 @@ func (cfg *SwiftConfig) Validate() error {
 
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *SwiftConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
-	f.StringVar(&cfg.ContainerName, prefix+"swift.container-name", "cortex", "Name of the Swift container to put chunks in.")
-	f.StringVar(&cfg.DomainName, prefix+"swift.domain-name", "", "Openstack user's domain name.")
-	f.StringVar(&cfg.DomainId, prefix+"swift.domain-id", "", "Openstack user's domain id.")
-	f.StringVar(&cfg.UserDomainName, prefix+"swift.user-domain-name", "", "Openstack user's domain name.")
-	f.StringVar(&cfg.UserDomainID, prefix+"swift.user-domain-id", "", "Openstack user's domain id.")
-	f.StringVar(&cfg.Username, prefix+"swift.username", "", "Openstack username for the api.")
-	f.StringVar(&cfg.UserId, prefix+"swift.user-id", "", "Openstack userid for the api.")
-	f.StringVar(&cfg.Password, prefix+"swift.password", "", "Openstack api key.")
-	f.StringVar(&cfg.AuthUrl, prefix+"swift.auth-url", "", "Openstack authentication URL.")
-	f.StringVar(&cfg.RegionName, prefix+"swift.region-name", "", "Openstack Region to use eg LON, ORD - default is use first region (v2,v3 auth only)")
-	f.StringVar(&cfg.ProjectName, prefix+"swift.project-name", "", "Openstack project name (v2,v3 auth only).")
-	f.StringVar(&cfg.ProjectID, prefix+"swift.project-id", "", "Openstack project id (v2,v3 auth only).")
-	f.StringVar(&cfg.ProjectDomainName, prefix+"swift.project-domain-name", "", "Name of the project's domain (v3 auth only), only needed if it differs from the user domain.")
-	f.StringVar(&cfg.ProjectDomainID, prefix+"swift.project-domain-id", "", "Id of the project's domain (v3 auth only), only needed if it differs the from user domain.")
+	cfg.Config.RegisterFlagsWithPrefix(prefix, f)
 }
 
 // NewSwiftObjectClient makes a new chunk.Client that writes chunks to OpenStack Swift.
-func NewSwiftObjectClient(cfg SwiftConfig, delimiter string) (*SwiftObjectClient, error) {
-	util.WarnExperimentalUse("OpenStack Swift Storage")
+func NewSwiftObjectClient(cfg SwiftConfig) (*SwiftObjectClient, error) {
+	log.WarnExperimentalUse("OpenStack Swift Storage")
 
 	// Create a connection
 	c := &swift.Connection{
-		AuthUrl:  cfg.AuthUrl,
-		ApiKey:   cfg.Password,
-		UserName: cfg.Username,
-		UserId:   cfg.UserId,
-
+		AuthVersion:    cfg.AuthVersion,
+		AuthUrl:        cfg.AuthURL,
+		ApiKey:         cfg.Password,
+		UserName:       cfg.Username,
+		UserId:         cfg.UserID,
+		Retries:        cfg.MaxRetries,
+		ConnectTimeout: cfg.ConnectTimeout,
+		Timeout:        cfg.RequestTimeout,
 		TenantId:       cfg.ProjectID,
 		Tenant:         cfg.ProjectName,
 		TenantDomain:   cfg.ProjectDomainName,
 		TenantDomainId: cfg.ProjectDomainID,
-
-		Domain:   cfg.DomainName,
-		DomainId: cfg.DomainId,
-
-		Region: cfg.RegionName,
+		Domain:         cfg.DomainName,
+		DomainId:       cfg.DomainID,
+		Region:         cfg.RegionName,
 	}
 
 	switch {
@@ -81,14 +68,6 @@ func NewSwiftObjectClient(cfg SwiftConfig, delimiter string) (*SwiftObjectClient
 		c.Domain = cfg.UserDomainName
 	case cfg.UserDomainID != "":
 		c.DomainId = cfg.UserDomainID
-	}
-
-	if len(delimiter) > 1 {
-		return nil, fmt.Errorf("delimiter must be a single character but was %s", delimiter)
-	}
-	var delim rune
-	if len(delimiter) != 0 {
-		delim = []rune(delimiter)[0]
 	}
 
 	// Authenticate
@@ -103,9 +82,8 @@ func NewSwiftObjectClient(cfg SwiftConfig, delimiter string) (*SwiftObjectClient
 	}
 
 	return &SwiftObjectClient{
-		conn:      c,
-		cfg:       cfg,
-		delimiter: delim,
+		conn: c,
+		cfg:  cfg,
 	}, nil
 }
 
@@ -135,11 +113,19 @@ func (s *SwiftObjectClient) PutObject(ctx context.Context, objectKey string, obj
 }
 
 // List only objects from the store non-recursively
-func (s *SwiftObjectClient) List(ctx context.Context, prefix string) ([]chunk.StorageObject, []chunk.StorageCommonPrefix, error) {
-	objs, err := s.conn.Objects(s.cfg.ContainerName, &swift.ObjectsOpts{
-		Prefix:    prefix,
-		Delimiter: s.delimiter,
-	})
+func (s *SwiftObjectClient) List(ctx context.Context, prefix, delimiter string) ([]chunk.StorageObject, []chunk.StorageCommonPrefix, error) {
+	if len(delimiter) > 1 {
+		return nil, nil, fmt.Errorf("delimiter must be a single character but was %s", delimiter)
+	}
+
+	opts := &swift.ObjectsOpts{
+		Prefix: prefix,
+	}
+	if len(delimiter) > 0 {
+		opts.Delimiter = []rune(delimiter)[0]
+	}
+
+	objs, err := s.conn.Objects(s.cfg.ContainerName, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,8 +161,4 @@ func (s *SwiftObjectClient) DeleteObject(ctx context.Context, objectKey string) 
 		return chunk.ErrStorageObjectNotFound
 	}
 	return err
-}
-
-func (s *SwiftObjectClient) PathSeparator() string {
-	return string(s.delimiter)
 }

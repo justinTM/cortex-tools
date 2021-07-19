@@ -54,12 +54,15 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
-	tsdberrors "github.com/prometheus/prometheus/tsdb/errors"
+
+	"github.com/thanos-io/thanos/pkg/errutil"
 )
 
 // Repeat executes f every interval seconds until stopc is closed or f returns an error.
@@ -136,7 +139,7 @@ func ExhaustCloseWithLogOnErr(logger log.Logger, r io.ReadCloser, format string,
 // CloseWithErrCapture runs function and on error return error by argument including the given error (usually
 // from caller function).
 func CloseWithErrCapture(err *error, closer io.Closer, format string, a ...interface{}) {
-	merr := tsdberrors.MultiError{}
+	merr := errutil.MultiError{}
 
 	merr.Add(*err)
 	merr.Add(errors.Wrapf(closer.Close(), format, a...))
@@ -151,9 +154,66 @@ func ExhaustCloseWithErrCapture(err *error, r io.ReadCloser, format string, a ..
 	CloseWithErrCapture(err, r, format, a...)
 
 	// Prepend the io.Copy error.
-	merr := tsdberrors.MultiError{}
+	merr := errutil.MultiError{}
 	merr.Add(copyErr)
 	merr.Add(*err)
 
 	*err = merr.Err()
+}
+
+// DeleteAll deletes all files and directories inside the given
+// dir except for the ignoreDirs directories.
+// NOTE: DeleteAll is not idempotent.
+func DeleteAll(dir string, ignoreDirs ...string) error {
+	entries, err := ioutil.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return errors.Wrap(err, "read dir")
+	}
+	var groupErrs errutil.MultiError
+
+	var matchingIgnores []string
+	for _, d := range entries {
+		if !d.IsDir() {
+			if err := os.RemoveAll(filepath.Join(dir, d.Name())); err != nil {
+				groupErrs.Add(err)
+			}
+			continue
+		}
+
+		// ignoreDirs might be multi-directory paths.
+		matchingIgnores = matchingIgnores[:0]
+		ignore := false
+		for _, ignoreDir := range ignoreDirs {
+			id := strings.Split(ignoreDir, "/")
+			if id[0] == d.Name() {
+				if len(id) == 1 {
+					ignore = true
+					break
+				}
+				matchingIgnores = append(matchingIgnores, filepath.Join(id[1:]...))
+			}
+		}
+
+		if ignore {
+			continue
+		}
+
+		if len(matchingIgnores) == 0 {
+			if err := os.RemoveAll(filepath.Join(dir, d.Name())); err != nil {
+				groupErrs.Add(err)
+			}
+			continue
+		}
+		if err := DeleteAll(filepath.Join(dir, d.Name()), matchingIgnores...); err != nil {
+			groupErrs.Add(err)
+		}
+	}
+
+	if groupErrs.Err() != nil {
+		return errors.Wrap(groupErrs.Err(), "delete file/dir")
+	}
+	return nil
 }

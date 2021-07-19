@@ -19,8 +19,8 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/util"
-	pkgutil "github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 // Config for a StorageClient
@@ -33,7 +33,10 @@ type Config struct {
 	DisableInitialHostLookup bool                `yaml:"disable_initial_host_lookup"`
 	SSL                      bool                `yaml:"SSL"`
 	HostVerification         bool                `yaml:"host_verification"`
+	HostSelectionPolicy      string              `yaml:"host_selection_policy"`
 	CAPath                   string              `yaml:"CA_path"`
+	CertPath                 string              `yaml:"tls_cert_path"`
+	KeyPath                  string              `yaml:"tls_key_path"`
 	Auth                     bool                `yaml:"auth"`
 	Username                 string              `yaml:"username"`
 	Password                 flagext.Secret      `yaml:"password"`
@@ -51,6 +54,11 @@ type Config struct {
 	TableOptions             string              `yaml:"table_options"`
 }
 
+const (
+	HostPolicyRoundRobin = "round-robin"
+	HostPolicyTokenAware = "token-aware"
+)
+
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.Addresses, "cassandra.addresses", "", "Comma-separated hostnames or IPs of Cassandra instances.")
@@ -61,7 +69,10 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.BoolVar(&cfg.DisableInitialHostLookup, "cassandra.disable-initial-host-lookup", false, "Instruct the cassandra driver to not attempt to get host info from the system.peers table.")
 	f.BoolVar(&cfg.SSL, "cassandra.ssl", false, "Use SSL when connecting to cassandra instances.")
 	f.BoolVar(&cfg.HostVerification, "cassandra.host-verification", true, "Require SSL certificate validation.")
+	f.StringVar(&cfg.HostSelectionPolicy, "cassandra.host-selection-policy", HostPolicyRoundRobin, "Policy for selecting Cassandra host. Supported values are: round-robin, token-aware.")
 	f.StringVar(&cfg.CAPath, "cassandra.ca-path", "", "Path to certificate file to verify the peer.")
+	f.StringVar(&cfg.CertPath, "cassandra.tls-cert-path", "", "Path to certificate file used by TLS.")
+	f.StringVar(&cfg.KeyPath, "cassandra.tls-key-path", "", "Path to private key file used by TLS.")
 	f.BoolVar(&cfg.Auth, "cassandra.auth", false, "Enable password authentication when connecting to cassandra.")
 	f.StringVar(&cfg.Username, "cassandra.username", "", "Username to use when connecting to cassandra.")
 	f.Var(&cfg.Password, "cassandra.password", "Password to use when connecting to cassandra.")
@@ -86,6 +97,12 @@ func (cfg *Config) Validate() error {
 	if cfg.SSL && cfg.HostVerification && len(strings.Split(cfg.Addresses, ",")) != 1 {
 		return errors.Errorf("Host verification is only possible for a single host.")
 	}
+	if cfg.SSL && cfg.CertPath != "" && cfg.KeyPath == "" {
+		return errors.Errorf("TLS certificate specified, but private key configuration is missing.")
+	}
+	if cfg.SSL && cfg.KeyPath != "" && cfg.CertPath == "" {
+		return errors.Errorf("TLS private key specified, but certificate configuration is missing.")
+	}
 	return nil
 }
 
@@ -99,7 +116,7 @@ func (cfg *Config) session(name string, reg prometheus.Registerer) (*gocql.Sessi
 	cluster.ConnectTimeout = cfg.ConnectTimeout
 	cluster.ReconnectInterval = cfg.ReconnectInterval
 	cluster.NumConns = cfg.NumConnections
-	cluster.Logger = log.With(pkgutil.Logger, "module", "gocql", "client", name)
+	cluster.Logger = log.With(util_log.Logger, "module", "gocql", "client", name)
 	cluster.Registerer = prometheus.WrapRegistererWith(
 		prometheus.Labels{"client": name}, reg)
 	if cfg.Retries > 0 {
@@ -144,20 +161,41 @@ func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
 	if cfg.SSL {
+		tlsConfig := &tls.Config{}
+
+		if cfg.CertPath != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.CertPath, cfg.KeyPath)
+			if err != nil {
+				return errors.Wrap(err, "Unable to load TLS certificate and private key")
+			}
+
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+
 		if cfg.HostVerification {
+			tlsConfig.ServerName = strings.Split(cfg.Addresses, ",")[0]
+
 			cluster.SslOpts = &gocql.SslOptions{
 				CaPath:                 cfg.CAPath,
 				EnableHostVerification: true,
-				Config: &tls.Config{
-					ServerName: strings.Split(cfg.Addresses, ",")[0],
-				},
+				Config:                 tlsConfig,
 			}
 		} else {
 			cluster.SslOpts = &gocql.SslOptions{
 				EnableHostVerification: false,
+				Config:                 tlsConfig,
 			}
 		}
 	}
+
+	if cfg.HostSelectionPolicy == HostPolicyRoundRobin {
+		cluster.PoolConfig.HostSelectionPolicy = gocql.RoundRobinHostPolicy()
+	} else if cfg.HostSelectionPolicy == HostPolicyTokenAware {
+		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.RoundRobinHostPolicy())
+	} else {
+		return errors.New("Unknown host selection policy")
+	}
+
 	if cfg.Auth {
 		password := cfg.Password.Value
 		if cfg.PasswordFile != "" {
@@ -362,6 +400,11 @@ func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callb
 	return errors.WithStack(scanner.Err())
 }
 
+// Allow other packages to interact with Cassandra directly
+func (s *StorageClient) GetReadSession() *gocql.Session {
+	return s.readSession
+}
+
 // readBatch represents a batch of rows read from Cassandra.
 type readBatch struct {
 	rangeValue []byte
@@ -514,7 +557,7 @@ type noopConvictionPolicy struct{}
 // Convicted means connections are removed - we don't want that.
 // Implementats gocql.ConvictionPolicy.
 func (noopConvictionPolicy) AddFailure(err error, host *gocql.HostInfo) bool {
-	level.Error(pkgutil.Logger).Log("msg", "Cassandra host failure", "err", err, "host", host.String())
+	level.Error(util_log.Logger).Log("msg", "Cassandra host failure", "err", err, "host", host.String())
 	return false
 }
 
